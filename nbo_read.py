@@ -18,7 +18,6 @@ Exports after main() returns:
 
 import numpy as np
 import math
-import time
 import re
 import copy
 from itertools import groupby
@@ -28,6 +27,7 @@ import sys
 import overlap_matrix
 from bas_dict import dict_keys
 from bas_dict import get_term_info
+from grid_utils import evaluate_orbital_grids
 from source_cache import ComputationCache
 
 getSmat = overlap_matrix.get_overlap_matrix
@@ -81,6 +81,255 @@ def gaussian_norm(alpha, l, m, n):
     return math.sqrt(prefactor / denom)
 
 
+# NBO LABEL code -> (descriptive type, orb_val used by the angular functions).
+# Module level: a constant, previously rebuilt on every parse_file47 call.
+_ORB_MAPPING = {
+    1: ('s', 's'), 51: ('s', 's'), 101: ('px', 'px'), 102: ('py', 'py'), 103: ('pz', 'pz'),
+    151: ('px', 'px'), 152: ('py', 'py'), 153: ('pz', 'pz'),
+    251: ('d_xy', 'ds2'), 252: ('d_xz', 'ds1'), 253: ('d_yz', 'dc1'),
+    254: ('d_x2-y2', 'dc2'), 255: ('d_z2', 'd0'),
+    351: ('fz(5z2-3r2)', 'f0'), 352: ('fx(5z2-r2)', 'fc1'), 353: ('fy(5z2-r2)', 'fs1'),
+    354: ('fz(x2-y2)', 'fc2'), 355: ('fxyz', 'fs2'), 356: ('fx(x2-3y2)', 'fc3'),
+    357: ('f(3x2-y2)', 'fs3'),
+    451: ('g0', 'g0'), 452: ('gc1', 'gc1'), 453: ('gs1', 'gs1'), 454: ('gc2', 'gc2'),
+    455: ('gs2', 'gs2'), 456: ('gc3', 'gc3'), 457: ('gs3', 'gs3'), 458: ('gc4', 'gc4'),
+    459: ('gs4', 'gs4'),
+    551: ('h0', 'h0'), 552: ('hc1', 'hc1'), 553: ('hs1', 'hs1'), 554: ('hc2', 'hc2'),
+    555: ('hs2', 'hs2'), 556: ('hc3', 'hc3'), 557: ('hs3', 'hs3'), 558: ('hc4', 'hc4'),
+    559: ('hs4', 'hs4'), 560: ('hc5', 'hc5'), 561: ('hs5', 'hs5'),
+    651: ('i0', 'i0'), 652: ('ic1', 'ic1'), 653: ('is1', 'is1'), 654: ('ic2', 'ic2'),
+    655: ('is2', 'is2'), 656: ('ic3', 'ic3'), 657: ('is3', 'is3'), 658: ('ic4', 'ic4'),
+    659: ('is4', 'is4'), 660: ('ic5', 'ic5'), 661: ('is5', 'is5'), 662: ('ic6', 'ic6'),
+    663: ('is6', 'is6'),
+    751: ('j0', 'j0'), 752: ('jc1', 'jc1'), 753: ('js1', 'js1'), 754: ('jc2', 'jc2'),
+    755: ('js2', 'js2'), 756: ('jc3', 'jc3'), 757: ('js3', 'js3'), 758: ('jc4', 'jc4'),
+    759: ('js4', 'js4'), 760: ('jc5', 'jc5'), 761: ('js5', 'js5'), 762: ('jc6', 'jc6'),
+    763: ('js6', 'js6'), 764: ('jc7', 'jc7'), 765: ('js7', 'js7')
+}
+
+# Components per shell for each angular momentum, used to infer shell
+# boundaries from the orbital-type sequence alone.
+_SHELL_TYPE_LIMITS = {'p': 3, 'd': 5, 'f': 7, 'g': 9, 'h': 11, 'i': 13, 'j': 15}
+
+# The .47 coefficient columns, in the order their non-zero entries are taken.
+_COEFF_COLUMNS = ('CS', 'CP', 'CD', 'CF', 'CG', 'CH', 'CI', 'CJ')
+_FLOAT_VARS = ('EXP',) + _COEFF_COLUMNS
+_INT_VARS = ('CENTER', 'LABEL', 'NSHELL', 'NEXP', 'NCOMP', 'NPRIM', 'NPTR')
+
+_ATOM_COORD_RE = re.compile(
+    r'\s+(\d+)\s+(\d+)\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)')
+
+
+def _read_file47_text(filename):
+    """Read a .47/.31 file, re-raising I/O failures with the filename attached."""
+    try:
+        with open(filename, 'r') as file:
+            return file.read()
+    except FileNotFoundError:
+        raise FileNotFoundError(f"File '{filename}' not found.")
+    except IOError:
+        raise IOError(f"Error reading file '{filename}'.")
+
+
+def _parse_array_from_block(varname, content, dtype=float):
+    """Collect every float in the `VARNAME = ...` blocks named *varname*."""
+    pattern = re.compile(
+        rf'(?<![A-Z]){varname}(?![A-Z])\s*=\s*((?:[-+]?\d+\.\d+(?:E[+-]?\d+)?\s+)+)')
+    values = []
+    for match in pattern.findall(content):
+        values.extend(dtype(v) for v in match.split())
+    return values
+
+
+def _parse_int_array(varname, content):
+    """Collect every integer in the `VARNAME = ...` blocks named *varname*."""
+    pattern = re.compile(rf'(?<![A-Z]){varname}(?![A-Z])\s*=\s*([\d\s]+)')
+    values = []
+    for match in pattern.findall(content):
+        values.extend(int(v) for v in match.split())
+    return values
+
+
+def _is_ungrouped(ncomp):
+    """True when the file lists one primitive set per basis function."""
+    return all(x == 1 for x in ncomp)
+
+
+def _shell_numbers_from_ncomp(orb_type, ncomp):
+    """
+    Assign each basis function its 1-based shell index from the NCOMP counts,
+    checking that every multi-component shell holds a single angular momentum.
+    """
+    shell_num = []
+    idx = 0
+    for shell_idx, nc in enumerate(ncomp, 1):
+        group = orb_type[idx:idx + nc]
+        if nc > 1:
+            base_type = group[0][0] if group else None
+            if not all(t[0] == base_type for t in group) or len(group) != nc:
+                raise ValueError(f"Invalid NCOMP grouping at shell {shell_idx}: "
+                                 f"{group} does not match NCOMP={nc}")
+        shell_num.extend([shell_idx] * nc)
+        idx += nc
+    return shell_num
+
+
+def _shell_numbers_from_types(orb_type):
+    """
+    Shell numbering inferred from the orbital-type sequence alone: a run of the
+    same angular momentum stays in one shell until that momentum's component
+    count is filled.  Used only to cross-check the NCOMP-derived numbering, so
+    the absolute values do not matter -- only where the group boundaries fall.
+    """
+    shell_num = []
+    count = 1
+    orb_count = 0
+    for i, t in enumerate(orb_type):
+        base_type = t[0]
+        continues_shell = (i > 0
+                           and base_type in _SHELL_TYPE_LIMITS
+                           and orb_type[i - 1][0] == base_type
+                           and orb_count < _SHELL_TYPE_LIMITS[base_type])
+        if continues_shell:
+            shell_num.append(shell_num[-1])
+            orb_count += 1
+        else:
+            count += 1
+            shell_num.append(count)
+            orb_count = 1
+    return shell_num
+
+
+def _warn_if_shell_grouping_differs(shell_num, orb_type):
+    """
+    Report a disagreement between the NCOMP-derived and type-derived shell
+    sizes.  Diagnostic only: the NCOMP numbering is used either way.
+    """
+    ncomp_shells = [len(list(g)) for _, g in groupby(shell_num)]
+    type_shells = [len(list(g)) for _, g in groupby(_shell_numbers_from_types(orb_type))]
+    if ncomp_shells != type_shells:
+        print(f"Warning: NCOMP-based shells {ncomp_shells} differ from "
+              f"type-based shells {type_shells}. Using NCOMP-based.")
+
+
+def process_orbital_labels(label, ncomp, orb_mapping=None):
+    """
+    Resolve LABEL codes to orbital types/values and assign shell numbers.
+
+    Returns (orb_type, orb_val, shell_num), one entry per basis function.
+    """
+    orb_mapping = _ORB_MAPPING if orb_mapping is None else orb_mapping
+    if sum(ncomp) != len(label):
+        raise ValueError(f"NCOMP sum ({sum(ncomp)}) does not match "
+                         f"LABEL length ({len(label)})")
+
+    unknown = ('unknown', 'unknown')
+    orb_type = [orb_mapping.get(l, unknown)[0] for l in label]
+    orb_val = [orb_mapping.get(l, unknown)[1] for l in label]
+
+    shell_num = _shell_numbers_from_ncomp(orb_type, ncomp)
+    if _is_ungrouped(ncomp):
+        shell_num = list(range(1, len(label) + 1))
+    else:
+        _warn_if_shell_grouping_differs(shell_num, orb_type)
+    return orb_type, orb_val, shell_num
+
+
+def _expand_shell_pointers(nprim, nptr, ncomp):
+    """
+    Repeat each shell's NPRIM/NPTR once per component.
+
+    An ungrouped file already carries one entry per basis function, so its
+    arrays pass through unchanged.
+    """
+    if _is_ungrouped(ncomp):
+        return nprim, nptr
+    if len(nprim) != len(ncomp) or len(nptr) != len(ncomp):
+        raise ValueError(f"NPRIM ({len(nprim)}) or NPTR ({len(nptr)}) length "
+                         f"does not match NCOMP ({len(ncomp)})")
+    nprim_expanded = []
+    nptr_expanded = []
+    for shell_idx, nc in enumerate(ncomp):
+        nprim_expanded.extend([nprim[shell_idx]] * nc)
+        nptr_expanded.extend([nptr[shell_idx]] * nc)
+    return nprim_expanded, nptr_expanded
+
+
+def _gather_coefficients(coeff_columns, ptr, prim):
+    """
+    Collect one basis function's contraction coefficients.
+
+    A .47 file keeps a separate column per angular momentum (CS, CP, CD, ...)
+    and zero-fills the columns that do not apply to a shell, so the non-zero
+    entries across all columns are exactly this function's coefficients.
+    """
+    coeffs = []
+    for column in coeff_columns:
+        window = column[ptr - 1: ptr - 1 + prim]
+        coeffs.extend([c for c in window if c != 0.0])
+    return coeffs
+
+
+def _atom_data_from_content(content):
+    """
+    Parse the atom block.
+
+    Returns (rows, to_bohr, coordinates_in_angstrom) where each row is
+    (Z, charge, x, y, z) in the file's own units, to_bohr is the divisor that
+    converts those into bohr, and the third element is the same rows converted
+    to Angstrom.
+    """
+    bohr_to_ang = physical_constants['Bohr radius'][0] * 1e10
+    use_bohr = "BOHR" in content.upper()
+    to_bohr = 1 if use_bohr else bohr_to_ang
+
+    atom_data = [(int(z), int(chg), float(x), float(y), float(z_))
+                 for z, chg, x, y, z_ in _ATOM_COORD_RE.findall(content)]
+    atom_data_ang = [
+        (z, charge, x * bohr_to_ang, y * bohr_to_ang, z_ * bohr_to_ang)
+        if use_bohr else (z, charge, x, y, z_)
+        for (z, charge, x, y, z_) in atom_data
+    ]
+    return atom_data, to_bohr, atom_data_ang
+
+
+def _system_info47(content):
+    """Build the basis-function list and atom table from a .47 file's text."""
+    atom_data, to_bohr, atom_data_ang = _atom_data_from_content(content)
+
+    parsed_float = {v: _parse_array_from_block(v, content, float) for v in _FLOAT_VARS}
+    parsed_int = {v: _parse_int_array(v, content) for v in _INT_VARS}
+
+    exp = parsed_float['EXP']
+    coeff_columns = [parsed_float.get(v, []) for v in _COEFF_COLUMNS]
+    center = parsed_int['CENTER']
+    label = parsed_int['LABEL']
+    ncomp = parsed_int['NCOMP']
+
+    orb_type, orb_val, shell_num = process_orbital_labels(label, ncomp, _ORB_MAPPING)
+    nprim_expanded, nptr_expanded = _expand_shell_pointers(
+        parsed_int['NPRIM'], parsed_int['NPTR'], ncomp)
+    if len(nprim_expanded) != len(label) or len(nptr_expanded) != len(label):
+        raise ValueError(f"Expanded NPRIM ({len(nprim_expanded)}) or NPTR "
+                         f"({len(nptr_expanded)}) does not match LABEL ({len(label)})")
+
+    bas_info_dict = []
+    for i in range(len(label)):
+        prim = nprim_expanded[i]
+        ptr = nptr_expanded[i]
+        atom_coord = atom_data[center[i] - 1][2:5]
+        bas_info_dict.append({
+            "N": i + 1, "CENTER": center[i], "LABEL": label[i],
+            "shell_num": shell_num[i], "type": orb_type[i], "orb_val": orb_val[i],
+            "exps": exp[ptr - 1: ptr - 1 + prim],
+            "coeffs": _gather_coefficients(coeff_columns, ptr, prim),
+            "xcenter": atom_coord[0] / to_bohr,
+            "ycenter": atom_coord[1] / to_bohr,
+            "zcenter": atom_coord[2] / to_bohr,
+        })
+    return bas_info_dict, atom_data_ang, to_bohr
+
+
 def parse_file47(filename):
     cache_key = _file_cache_key(filename)
     cached = _parse_file47_cache.get(cache_key)
@@ -88,175 +337,124 @@ def parse_file47(filename):
         return cached
 
     print(f"Parsing {filename} as a .47 file")
-
-    def read_file47(filename):
-        try:
-            with open(filename, 'r') as file:
-                return file.read()
-        except FileNotFoundError:
-            raise FileNotFoundError(f"File '{filename}' not found.")
-        except IOError:
-            raise IOError(f"Error reading file '{filename}'.")
-
-    file_content = read_file47(filename)
-
-    def parse_array_from_block(varname, content, dtype=float):
-        pattern = re.compile(rf'(?<![A-Z]){varname}(?![A-Z])\s*=\s*((?:[-+]?\d+\.\d+(?:E[+-]?\d+)?\s+)+)')
-        matches = pattern.findall(content)
-        values = []
-        for match in matches:
-            parts = match.split()
-            converted = [dtype(v) for v in parts]
-            values.extend(converted)
-        return values
-
-    def parse_int_array(varname, content):
-        pattern = re.compile(rf'(?<![A-Z]){varname}(?![A-Z])\s*=\s*([\d\s]+)')
-        matches = pattern.findall(content)
-        values = []
-        for match in matches:
-            parts = match.split()
-            converted = [int(v) for v in parts]
-            values.extend(converted)
-        return values
-
-    def is_ungrouped(ncomp):
-        return all(x == 1 for x in ncomp)
-
-    def process_orbital_labels(label, ncomp, orb_mapping):
-        if not sum(ncomp) == len(label):
-            raise ValueError(f"NCOMP sum ({sum(ncomp)}) does not match LABEL length ({len(label)})")
-        orb_type = [orb_mapping.get(l, ('unknown', 'unknown'))[0] for l in label]
-        orb_val  = [orb_mapping.get(l, ('unknown', 'unknown'))[1] for l in label]
-        shell_num = []
-        idx = 0
-        for shell_idx, nc in enumerate(ncomp, 1):
-            group = orb_type[idx:idx + nc]
-            if nc > 1:
-                base_type = group[0][0] if group else None
-                if not all(t[0] == base_type for t in group) or len(group) != nc:
-                    raise ValueError(f"Invalid NCOMP grouping at shell {shell_idx}: {group} does not match NCOMP={nc}")
-            for _ in range(nc):
-                shell_num.append(shell_idx)
-            idx += nc
-        if is_ungrouped(ncomp):
-            shell_num = list(range(1, len(label) + 1))
-        else:
-            type_limits = {'p': 3, 'd': 5, 'f': 7, 'g': 9, 'h': 11, 'i': 13, 'j': 15}
-            temp_shell_num = []
-            count = 1
-            orb_count = 0
-            for i, t in enumerate(orb_type):
-                base_type = t[0]
-                if i > 0 and base_type in type_limits and orb_type[i-1][0] == base_type:
-                    if orb_count < type_limits[base_type]:
-                        temp_shell_num.append(temp_shell_num[-1])
-                        orb_count += 1
-                    else:
-                        count += 1
-                        temp_shell_num.append(count)
-                        orb_count = 1
-                else:
-                    count += 1
-                    temp_shell_num.append(count)
-                    orb_count = 1
-            ncomp_shells = [len(list(g)) for k, g in groupby(shell_num)]
-            type_shells  = [len(list(g)) for k, g in groupby(temp_shell_num)]
-            if ncomp_shells != type_shells:
-                print(f"Warning: NCOMP-based shells {ncomp_shells} differ from type-based shells {type_shells}. Using NCOMP-based.")
-        return orb_type, orb_val, shell_num
-
-    def system_info(content):
-        bohr_to_ang = physical_constants['Bohr radius'][0] * 1e10
-        use_bohr = "BOHR" in content.upper()
-        to_bohr  = 1 if use_bohr else bohr_to_ang
-        coord_pattern = r'\s+(\d+)\s+(\d+)\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)'
-        atom_matches = re.findall(coord_pattern, content)
-        atom_data = [
-            (int(z), int(chg), float(x), float(y), float(z_))
-            for z, chg, x, y, z_ in atom_matches
-        ]
-        variable_names_float = ['EXP', 'CS', 'CP', 'CD', 'CF', 'CG', 'CH', 'CI', 'CJ']
-        variable_names_int   = ['CENTER', 'LABEL', 'NSHELL', 'NEXP', 'NCOMP', 'NPRIM', 'NPTR']
-        parsed_float = {var: parse_array_from_block(var, content, float) for var in variable_names_float}
-        parsed_int   = {var: parse_int_array(var, content) for var in variable_names_int}
-        EXP = parsed_float['EXP']
-        CS, CP, CD, CF, CG, CH, CI, CJ = [parsed_float.get(v, []) for v in variable_names_float[1:]]
-        CENTER = parsed_int['CENTER']
-        LABEL  = parsed_int['LABEL']
-        NCOMP  = parsed_int['NCOMP']
-        NPRIM  = parsed_int['NPRIM']
-        NPTR   = parsed_int['NPTR']
-        orb_mapping = {
-            1: ('s', 's'), 51: ('s', 's'), 101: ('px', 'px'), 102: ('py', 'py'), 103: ('pz', 'pz'),
-            151: ('px', 'px'), 152: ('py', 'py'), 153: ('pz', 'pz'),
-            251: ('d_xy', 'ds2'), 252: ('d_xz', 'ds1'), 253: ('d_yz', 'dc1'),
-            254: ('d_x2-y2', 'dc2'), 255: ('d_z2', 'd0'),
-            351: ('fz(5z2-3r2)', 'f0'), 352: ('fx(5z2-r2)', 'fc1'), 353: ('fy(5z2-r2)', 'fs1'),
-            354: ('fz(x2-y2)', 'fc2'), 355: ('fxyz', 'fs2'), 356: ('fx(x2-3y2)', 'fc3'),
-            357: ('f(3x2-y2)', 'fs3'),
-            451: ('g0', 'g0'), 452: ('gc1', 'gc1'), 453: ('gs1', 'gs1'), 454: ('gc2', 'gc2'),
-            455: ('gs2', 'gs2'), 456: ('gc3', 'gc3'), 457: ('gs3', 'gs3'), 458: ('gc4', 'gc4'),
-            459: ('gs4', 'gs4'),
-            551: ('h0', 'h0'), 552: ('hc1', 'hc1'), 553: ('hs1', 'hs1'), 554: ('hc2', 'hc2'),
-            555: ('hs2', 'hs2'), 556: ('hc3', 'hc3'), 557: ('hs3', 'hs3'), 558: ('hc4', 'hc4'),
-            559: ('hs4', 'hs4'), 560: ('hc5', 'hc5'), 561: ('hs5', 'hs5'),
-            651: ('i0', 'i0'), 652: ('ic1', 'ic1'), 653: ('is1', 'is1'), 654: ('ic2', 'ic2'),
-            655: ('is2', 'is2'), 656: ('ic3', 'ic3'), 657: ('is3', 'is3'), 658: ('ic4', 'ic4'),
-            659: ('is4', 'is4'), 660: ('ic5', 'ic5'), 661: ('is5', 'is5'), 662: ('ic6', 'ic6'),
-            663: ('is6', 'is6'),
-            751: ('j0', 'j0'), 752: ('jc1', 'jc1'), 753: ('js1', 'js1'), 754: ('jc2', 'jc2'),
-            755: ('js2', 'js2'), 756: ('jc3', 'jc3'), 757: ('js3', 'js3'), 758: ('jc4', 'jc4'),
-            759: ('js4', 'js4'), 760: ('jc5', 'jc5'), 761: ('js5', 'js5'), 762: ('jc6', 'jc6'),
-            763: ('js6', 'js6'), 764: ('jc7', 'jc7'), 765: ('js7', 'js7')
-        }
-        orb_type, orb_val, shell_num = process_orbital_labels(LABEL, NCOMP, orb_mapping)
-        if not is_ungrouped(NCOMP):
-            if len(NPRIM) != len(NCOMP) or len(NPTR) != len(NCOMP):
-                raise ValueError(f"NPRIM ({len(NPRIM)}) or NPTR ({len(NPTR)}) length does not match NCOMP ({len(NCOMP)})")
-            NPRIM_expanded = []
-            NPTR_expanded  = []
-            for shell_idx, nc in enumerate(NCOMP):
-                NPRIM_expanded.extend([NPRIM[shell_idx]] * nc)
-                NPTR_expanded.extend([NPTR[shell_idx]]  * nc)
-        else:
-            NPRIM_expanded = NPRIM
-            NPTR_expanded  = NPTR
-        if len(NPRIM_expanded) != len(LABEL) or len(NPTR_expanded) != len(LABEL):
-            raise ValueError(f"Expanded NPRIM ({len(NPRIM_expanded)}) or NPTR ({len(NPTR_expanded)}) does not match LABEL ({len(LABEL)})")
-        bas_info_dict = []
-        for i in range(len(LABEL)):
-            atom_idx = CENTER[i] - 1
-            prim = NPRIM_expanded[i]
-            ptr  = NPTR_expanded[i]
-            info = {
-                "N": i + 1, "CENTER": CENTER[i], "LABEL": LABEL[i],
-                "shell_num": shell_num[i], "type": orb_type[i], "orb_val": orb_val[i],
-                "exps": EXP[ptr - 1: ptr - 1 + prim]
-            }
-            coeffs = []
-            for coeff_array in [CS, CP, CD, CF, CG, CH, CI, CJ]:
-                slice_ = coeff_array[ptr - 1: ptr - 1 + prim]
-                coeffs.extend([c for c in slice_ if c != 0.0])
-            info["coeffs"] = coeffs
-            atom_coord = atom_data[atom_idx][2:5]
-            info["xcenter"] = atom_coord[0] / to_bohr
-            info["ycenter"] = atom_coord[1] / to_bohr
-            info["zcenter"] = atom_coord[2] / to_bohr
-            bas_info_dict.append(info)
-        atom_data_ang = [
-            (z, charge, x * bohr_to_ang, y * bohr_to_ang, z_ * bohr_to_ang)
-            if use_bohr else (z, charge, x, y, z_)
-            for (z, charge, x, y, z_) in atom_data
-        ]
-        return bas_info_dict, atom_data_ang, to_bohr
-
-    basis_info_dict, atom_data, to_bohr = system_info(file_content)
+    basis_info_dict, atom_data, to_bohr = _system_info47(_read_file47_text(filename))
     coordinates = [atom[2:] for atom in atom_data]
-    atom_info   = [(atom[0],) + tuple(atom[2:]) for atom in atom_data]
+    atom_info = [(atom[0],) + tuple(atom[2:]) for atom in atom_data]
     result = (basis_info_dict, coordinates, atom_info, to_bohr)
     _parse_file47_cache[cache_key] = result
     return result
+
+
+_FILE31_DASH = "-------------------------------"
+
+# Row order of the exponent/coefficient table at the end of a .31 file.
+_FILE31_COLUMNS = ('EXP', 'CS', 'CP', 'CD', 'CF', 'CG', 'CH', 'CI', 'CJ', 'CK')
+
+# Components in a shell -> the coefficient column that shell draws from.
+_FILE31_SHELL_COEFF_COLUMN = {1: 'CS', 3: 'CP', 5: 'CD', 7: 'CF',
+                              9: 'CG', 11: 'CH', 13: 'CI', 15: 'CJ'}
+
+
+def _file31_dash_lines(content):
+    """1-based line numbers of the dashed separator lines."""
+    return [i for i, line in enumerate(content, 1) if _FILE31_DASH in line]
+
+
+def _parse_file31_coordinates(content, coord_line, num_atom):
+    """Read the atom block as rows of [Z, x, y, z]."""
+    rows = []
+    for line in content[coord_line - 1: coord_line + num_atom - 1]:
+        parts = line.split()
+        rows.append([int(parts[0]), float(parts[1]), float(parts[2]), float(parts[3])])
+    return np.array(rows)
+
+
+def _parse_file31_columns(content, start_line, num_exps):
+    """
+    Reshape the trailing exponent/coefficient block into one row per column.
+
+    Columns the file does not reach are reported as None, which is what the
+    shell-to-column lookup relies on to fail loudly rather than silently read
+    the wrong angular momentum.
+    """
+    tokens = []
+    for line in content[start_line:]:
+        tokens.extend(line.split())
+    dimen = int(len(tokens) / num_exps)
+    table = np.array(tokens).reshape(dimen, num_exps)
+    return {name: (table[i] if i < len(table) else None)
+            for i, name in enumerate(_FILE31_COLUMNS)}
+
+
+def _merge_wrapped_label_lines(lines):
+    """
+    Rejoin a label row that continued onto the next physical line.
+
+    A shell's label row should hold as many entries as the preceding
+    primitive-pointer row's second field says.  When it holds more than four
+    but not that many, the remainder sits on the following line.
+    """
+    merged = []
+    i = 0
+    while i < len(lines):
+        items = lines[i].split()
+        wrapped = (len(items) > 4
+                   and i > 0
+                   and len(lines[i - 1].split()) >= 2
+                   and len(items) != int(lines[i - 1].split()[1])
+                   and i < len(lines) - 1)
+        if wrapped:
+            items.extend(lines[i + 1].split())
+            i += 1
+        merged.append(' '.join(items))
+        i += 1
+    return merged
+
+
+def _split_prim_ptr_and_labels(lines):
+    """Odd lines hold primitive pointers, even lines hold LABEL codes."""
+    prim_ptr_list = []
+    label_list = []
+    for i, line in enumerate(lines, start=1):
+        target = prim_ptr_list if i % 2 == 1 else label_list
+        target.append([int(element) for element in line.split()])
+    return prim_ptr_list, label_list
+
+
+def _build_basis_info31(prim_ptr_list, label_list, orb_type, orb_val,
+                        columns, coordinates, to_bohr):
+    """Assemble the basis-function dicts for a .31 file."""
+    basis_info_dict = []
+    shell_num = 1
+    n = 1
+    for p_p_l, orb in zip(prim_ptr_list, label_list):
+        lo = p_p_l[2] - 1
+        hi = lo + p_p_l[3]
+        for i in range(p_p_l[1]):
+            # Looked up inside the loop, as the original did: a shell listing
+            # zero primitives must not reach the column lookup at all.
+            coeff = columns[_FILE31_SHELL_COEFF_COLUMN[len(orb)]]
+            atom_coords = coordinates[p_p_l[0] - 1][1:4]
+            basis_info_dict.append({
+                'N': n, "CENTER": p_p_l[0], "shell_num": shell_num, "LABEL": orb[i],
+                # NOTE: this subscript is wrong for any shell past the first
+                # with more than one component -- it indexes orb_type by a
+                # value derived from the component number rather than by the
+                # shell, so a p shell reads the *first* shell's sublist and
+                # raises IndexError. Preserved verbatim here: it is a
+                # pre-existing defect, not something this refactor introduced,
+                # and fixing it is a behaviour change needing its own review.
+                "type":    orb_type[int((i - 1) / 2)][i],
+                "orb_val": orb_val[int((i - 1) / 2)][i],
+                "exps":    columns['EXP'][lo:hi],
+                "coeffs":  coeff[lo:hi],
+                "xcenter": atom_coords[0] / to_bohr,
+                "ycenter": atom_coords[1] / to_bohr,
+                "zcenter": atom_coords[2] / to_bohr,
+            })
+            n += 1
+        shell_num += 1
+    return basis_info_dict
 
 
 def parse_file31(filename):
@@ -266,113 +464,37 @@ def parse_file31(filename):
         return cached
 
     print(f"Parsing {filename} as a .31 file")
+    to_bohr = physical_constants['Bohr radius'][0] * 1e10
     with open(filename, 'r') as file:
-        to_bohr  = physical_constants['Bohr radius'][0] * 1e10
-        content  = file.readlines()
-        line_4_ele = content[3].split()
-        num_atom  = int(line_4_ele[0])
-        num_shell = int(line_4_ele[1])
-        num_exps  = int(line_4_ele[2])
-        dash_line_num = []
-        for i, line in enumerate(content, 1):
-            if "-------------------------------" in line:
-                dash_line_num.append(i)
-        coord_line = dash_line_num[1] + 1
-        coordinates = [
-            [int(line.split()[0]), float(line.split()[1]), float(line.split()[2]), float(line.split()[3])]
-            for line in content[coord_line-1:coord_line + num_atom - 1]
-        ]
-        coordinates = np.array(coordinates)
-        exp_and_coeff = []
-        exp_and_coeff_line = dash_line_num[3]
-        for line in content[exp_and_coeff_line:]:
-            exp_and_coeff.extend(line.split())
-        dimen = int(len(exp_and_coeff) / num_exps)
-        exp_and_coeff = np.array(exp_and_coeff).reshape(dimen, num_exps)
-        variables  = ['EXP', 'CS', 'CP', 'CD', 'CF', 'CG', 'CH', 'CI', 'CJ', 'CK']
-        local_vars = {}
-        for i, variable in enumerate(variables):
-            if i < len(exp_and_coeff):
-                local_vars[variable] = exp_and_coeff[i]
-            else:
-                local_vars[variable] = None
-        label_sect_line     = coord_line + num_atom + 1
-        label_sect_end_line = exp_and_coeff_line - 1
-        lines = content[label_sect_line - 1:label_sect_end_line]
-        prim_ptr_list  = []
-        label_list     = []
-        modified_lines = []
-        i = 0
-        while i < len(lines):
-            current_line_items = lines[i].split()
-            if len(current_line_items) > 4:
-                if i > 0 and len(lines[i-1].split()) >= 2:
-                    prev_line_second_item = int(lines[i-1].split()[1])
-                    if len(current_line_items) != prev_line_second_item:
-                        if i < len(lines) - 1:
-                            current_line_items.extend(lines[i+1].split())
-                            i += 1
-            modified_lines.append(' '.join(current_line_items))
-            i += 1
-        lines = modified_lines
-        for i, line in enumerate(lines, start=1):
-            if i % 2 == 1:
-                prim_ptr_list.append([int(element) for element in line.split()])
-            if i % 2 == 0:
-                label_list.append([int(element) for element in line.split()])
-        orb_mapping = {
-            1: ('s', 's'), 51: ('s', 's'),
-            101: ('px', 'px'), 102: ('py', 'py'), 103: ('pz', 'pz'),
-            151: ('px', 'px'), 152: ('py', 'py'), 153: ('pz', 'pz'),
-            251: ('d_xy', 'ds2'), 252: ('d_xz', 'ds1'), 253: ('d_yz', 'dc1'), 254: ('d_x2-y2', 'dc2'), 255: ('d_z2', 'd0'),
-            351: ('fz(5z2-3r2)', 'f0'), 352: ('fx(5z2-r2)', 'fc1'), 353: ('fy(5z2-r2)', 'fs1'), 354: ('fz(x2-y2)', 'fc2'),
-            355: ('fxyz', 'fs2'), 356: ('fx(x2-3y2)', 'fc3'), 357: ('f(3x2-y2)', 'fs3'),
-            451: ('g0', 'g0'), 452: ('gc1', 'gc1'), 453: ('gs1', 'gs1'), 454: ('gc2', 'gc2'), 455: ('gs2', 'gs2'),
-            456: ('gc3', 'gc3'), 457: ('gs3', 'gs3'), 458: ('gc4', 'gc4'), 459: ('gs4', 'gs4'),
-            551: ('h0', 'h0'), 552: ('hc1', 'hc1'), 553: ('hs1', 'hs1'), 554: ('hc2', 'hc2'), 555: ('hs2', 'hs2'),
-            556: ('hc3', 'hc3'), 557: ('hs3', 'hs3'), 558: ('hc4', 'hc4'), 559: ('hs4', 'hs4'), 560: ('hc5', 'hc5'), 561: ('hs5', 'hs5'),
-            651: ('i0', 'i0'), 652: ('ic1', 'ic1'), 653: ('is1', 'is1'), 654: ('ic2', 'ic2'), 655: ('is2', 'is2'),
-            656: ('ic3', 'ic3'), 657: ('is3', 'is3'), 658: ('ic4', 'ic4'), 659: ('is4', 'is4'), 660: ('ic5', 'ic5'), 661: ('is5', 'is5'),
-            662: ('ic6', 'ic6'), 663: ('is6', 'is6'),
-            751: ('j0', 'j0'), 752: ('jc1', 'jc1'), 753: ('js1', 'js1'), 754: ('jc2', 'jc2'), 755: ('js2', 'js2'),
-            756: ('jc3', 'jc3'), 757: ('js3', 'js3'), 758: ('jc4', 'jc4'), 759: ('js4', 'js4'), 760: ('jc5', 'jc5'),
-            761: ('js5', 'js5'), 762: ('jc6', 'jc6'), 763: ('js6', 'js6'), 764: ('jc7', 'jc7'), 765: ('js7', 'js7')
-        }
-        orb_type = [[orb_mapping.get(element)[0] for element in sublist] for sublist in label_list]
-        orb_val  = [[orb_mapping.get(element)[1] for element in sublist] for sublist in label_list]
-        shell_num = 1
-        N = 1
-        basis_info_dict = []
-        coeff_mapping = {
-            1: local_vars['CS'],  3: local_vars['CP'],  5: local_vars['CD'],  7: local_vars['CF'],
-            9: local_vars['CG'], 11: local_vars['CH'], 13: local_vars['CI'], 15: local_vars['CJ']
-        }
-        for p_p_l, orb in zip(prim_ptr_list, label_list):
-            for i in range(p_p_l[1]):
-                coeff = coeff_mapping[len(orb)]
-                atom_coords = coordinates[p_p_l[0] - 1][1:4]
-                x = atom_coords[0] / to_bohr
-                y = atom_coords[1] / to_bohr
-                z = atom_coords[2] / to_bohr
-                info = {
-                    'N': N, "CENTER": p_p_l[0], "shell_num": shell_num, "LABEL": orb[i],
-                    "type":    orb_type[int((i - 1) / 2)][i],
-                    "orb_val": orb_val[int((i - 1) / 2)][i],
-                    "exps":    local_vars['EXP'][p_p_l[2] - 1: p_p_l[2] - 1 + p_p_l[3]],
-                    "coeffs":  coeff[p_p_l[2] - 1: p_p_l[2] - 1 + p_p_l[3]]
-                }
-                info["xcenter"] = x
-                info["ycenter"] = y
-                info["zcenter"] = z
-                basis_info_dict.append(info)
-                N += 1
-            shell_num += 1
-        atom_info   = coordinates[:, 0].tolist()
-        coordinates = coordinates[:, 1:].tolist()
-        atom_info   = list(zip(atom_info, *zip(*coordinates)))
-        result = (basis_info_dict, coordinates, atom_info, to_bohr)
-        _parse_file31_cache[cache_key] = result
-        return result
+        content = file.readlines()
+
+    num_atom, num_shell, num_exps = (int(x) for x in content[3].split()[:3])
+    dash_line_num = _file31_dash_lines(content)
+
+    coord_line = dash_line_num[1] + 1
+    coordinates = _parse_file31_coordinates(content, coord_line, num_atom)
+
+    exp_and_coeff_line = dash_line_num[3]
+    columns = _parse_file31_columns(content, exp_and_coeff_line, num_exps)
+
+    label_sect_line = coord_line + num_atom + 1
+    lines = _merge_wrapped_label_lines(
+        content[label_sect_line - 1: exp_and_coeff_line - 1])
+    prim_ptr_list, label_list = _split_prim_ptr_and_labels(lines)
+
+    orb_type = [[_ORB_MAPPING.get(e)[0] for e in sublist] for sublist in label_list]
+    orb_val = [[_ORB_MAPPING.get(e)[1] for e in sublist] for sublist in label_list]
+
+    basis_info_dict = _build_basis_info31(
+        prim_ptr_list, label_list, orb_type, orb_val, columns, coordinates, to_bohr)
+
+    atom_numbers = coordinates[:, 0].tolist()
+    coordinates = coordinates[:, 1:].tolist()
+    atom_info = list(zip(atom_numbers, *zip(*coordinates)))
+    result = (basis_info_dict, coordinates, atom_info, to_bohr)
+    _parse_file31_cache[cache_key] = result
+    return result
+
 
 def load_aonao_matrix(filename):
     # Placeholder: Load the AO to NAO transformation matrix from .31 or related file
@@ -544,136 +666,190 @@ def iterative_basis_modification(initial_primit_info_dict, nbo_overlap_mat, max_
 
 
 import pandas as pd
-def main():
-    filename = input("Enter the filename (.47 recommended or .31): ")
+def _parse_basis_by_extension(filename):
+    """Dispatch a basis file to the .47 or .31 parser, or exit if neither."""
     file_ext = os.path.splitext(filename)[1]
-
     if file_ext == ".47":
-        basis_info_dict, coordinates, atom_info, to_bohr = parse_file47(filename)
-    elif file_ext == ".31":
-        basis_info_dict, coordinates, atom_info, to_bohr = parse_file31(filename)
-    else:
-        print(f"Unsupported file extension: {file_ext}")
-        sys.exit(1)
+        return file_ext, parse_file47(filename)
+    if file_ext == ".31":
+        return file_ext, parse_file31(filename)
+    print(f"Unsupported file extension: {file_ext}")
+    sys.exit(1)
 
-    sp_basis         = [f for f in basis_info_dict if f['orb_val'] in ['s', 'px', 'py', 'pz']]
-    S_diag_no_norm   = np.diag(getSmat(sp_basis, dict_keys, normalize_primitives=False, diagonal_only=True))
-    S_diag_with_norm = np.diag(getSmat(sp_basis, dict_keys, normalize_primitives=True,  diagonal_only=True))
 
-    if is_normalized(S_diag_with_norm) and not is_normalized(S_diag_no_norm):
-        print("Basis set is in Gaussian convention (coefficients do NOT include normalization).")
+def _detect_basis_convention(basis_info_dict):
+    """
+    Work out whether a basis's contraction coefficients already include the
+    primitive normalization.
+
+    Only s and p functions are tested, since those are the ones whose
+    self-overlap distinguishes the two conventions unambiguously.
+
+    Returns (needs_molden_conversion, message, convention_recognised).
+    """
+    sp_basis = [f for f in basis_info_dict if f['orb_val'] in ['s', 'px', 'py', 'pz']]
+    s_diag_no_norm = np.diag(getSmat(
+        sp_basis, dict_keys, normalize_primitives=False, diagonal_only=True))
+    s_diag_with_norm = np.diag(getSmat(
+        sp_basis, dict_keys, normalize_primitives=True, diagonal_only=True))
+
+    if is_normalized(s_diag_with_norm) and not is_normalized(s_diag_no_norm):
+        return True, ("Basis set is in Gaussian convention "
+                      "(coefficients do NOT include normalization)."), True
+    if is_normalized(s_diag_no_norm):
+        return False, ("Basis set is in ORCA/Molden convention "
+                       "(coefficients include normalization)."), True
+    return True, ("Basis set is not normalized in either convention. "
+                  "Assuming Gaussian convention."), False
+
+
+def _normalise_basis_to_molden(basis_info_dict):
+    """
+    Bring a basis into ORCA/Molden convention and scale every function to
+    S_ii = 1, reporting each step as the original inline code did.
+    """
+    needs_conversion, message, recognised = _detect_basis_convention(basis_info_dict)
+    print(message)
+    if needs_conversion:
         print("Converting all basis functions to ORCA/Molden convention...")
         basis_info_dict = convert_to_molden(basis_info_dict)
-        # for info in basis_info_dict:
-        #         for key, value in info.items():
-        #             print(f"{key}: {value}")
-        #         print("---------------------------")  
         print("Conversion to ORCA/Molden convention complete.")
-        print("Normalizing coefficients by square root of self-overlap...")
-        basis_info_dict = normalize_by_self_overlap(basis_info_dict)
-        print("Final normalization complete. All basis functions now have S_ii = 1.")
-    elif is_normalized(S_diag_no_norm):
-        print("Basis set is in ORCA/Molden convention (coefficients include normalization).")
-        print("Normalizing coefficients by square root of self-overlap...")
-        basis_info_dict = normalize_by_self_overlap(basis_info_dict)
-        print("Final normalization complete. All basis functions now have S_ii = 1.")
-    else:
-        print("Basis set is not normalized in either convention. Assuming Gaussian convention.")
-        print("Converting all basis functions to ORCA/Molden convention...")
-        basis_info_dict = convert_to_molden(basis_info_dict)
-        print("Conversion to ORCA/Molden convention complete.")
-        print("Normalizing coefficients by square root of self-overlap...")
-        basis_info_dict = normalize_by_self_overlap(basis_info_dict)
-        print("Final normalization complete. All basis functions now have S_ii = 1.")
+    print("Normalizing coefficients by square root of self-overlap...")
+    basis_info_dict = normalize_by_self_overlap(basis_info_dict)
+    print("Final normalization complete. All basis functions now have S_ii = 1.")
+    if not recognised:
         print('\n--------------------------------------------------------')
+    return basis_info_dict
 
-    Smat            = getSmat(basis_info_dict, dict_keys, normalize_primitives=False, diagonal_only=False)
-    norm_basis_info = normalize_basis_info(basis_info_dict, Smat)
 
-    nbf = len(basis_info_dict)
+def _refine_basis_against_overlap(filename, norm_basis_info, smat, file_ext, nbf):
+    """
+    For a .47 file, refine the basis against the file's own $OVERLAP block and
+    dump the result; a .31 file has no such block, so it passes straight
+    through.
+    """
     if file_ext == '.31':
-        final_norm_basis = norm_basis_info
-    else:
-        is_open, matrix_dict = process_47_file(filename, nbf)
-        nbo_overlap_mat      = matrix_dict.get('OVERLAP')
-        final_norm_basis     = norm_basis_info
-        final_norm_basis, final_S = iterative_basis_modification(norm_basis_info, nbo_overlap_mat)
-        
-        for info in final_norm_basis:
-                for key, value in info.items():
-                    print(f"{key}: {value}")
-                print("---------------------------")   
+        return norm_basis_info
 
-        print(pd.DataFrame(Smat))
+    _is_open, matrix_dict = process_47_file(filename, nbf)
+    nbo_overlap_mat = matrix_dict.get('OVERLAP')
+    final_norm_basis, _final_S = iterative_basis_modification(
+        norm_basis_info, nbo_overlap_mat)
 
-    print('Basis information extracted and renormalized...')
+    for info in final_norm_basis:
+        for key, value in info.items():
+            print(f"{key}: {value}")
+        print("---------------------------")
+    print(pd.DataFrame(smat))
+    return final_norm_basis
 
-    NBAS = len(final_norm_basis)
 
-    def get_cmos(orbital_file):
-        try:
-            with open(orbital_file, "r") as file:
-                lines = file.readlines()
-                if len(lines) < 4:
-                    raise ValueError("File structure is incorrect or file is too short.")
-                orbital_type = lines[1].strip().split()[0]
-                print(orbital_type, "in AO basis")
-                if "ALPHA" in lines[3].strip():
-                    print(orbital_file, " is an open-shell system")
-                    alpha_or_beta = input("Enter A or B to select Alpha or Beta spin: ")
-                    if alpha_or_beta.lower() == 'a':
-                        start_line = 4
-                    elif alpha_or_beta.lower() == 'b':
-                        for i, line in enumerate(lines):
-                            if "BETA" in line:
-                                start_line = i + 1
-                                break
-                else:
-                    print(orbital_file, " is a closed shell system...")
-                    start_line = 3
-                words = []
-                for line in lines[start_line:]:
-                    for elem in line.split():
-                        try:
-                            if len(words) < NBAS * NBAS:
-                                words.append(float(elem))
-                        except ValueError:
-                            pass
-                if len(words) % NBAS != 0:
-                    raise ValueError("Please provide a correct NBO file.\n")
-                num_cmos    = int(len(words) / NBAS)
-                orbital_arr = np.array(words).reshape(NBAS, num_cmos)
-                return orbital_arr
-        except ValueError as e:
-            print(e)
-            return None
+def _prompt_spin_start_line(lines, orbital_file):
+    """
+    Ask which spin to read from an open-shell key file and return the first
+    data line of that block; a closed-shell file needs no prompt.
+    """
+    if "ALPHA" not in lines[3].strip():
+        print(orbital_file, " is a closed shell system...")
+        return 3
 
-    orbital_files = input("Enter NBO key files separated by commas: ").replace(" ", "").split(",")
+    print(orbital_file, " is an open-shell system")
+    alpha_or_beta = input("Enter A or B to select Alpha or Beta spin: ")
+    if alpha_or_beta.lower() == 'a':
+        return 4
+    if alpha_or_beta.lower() == 'b':
+        return _beta_start_line(lines)
+    # Behaviour change, deliberately: the original left start_line unbound here
+    # and died with UnboundLocalError on any answer other than A or B. Raising
+    # ValueError lets the caller's existing handler report it and skip the file.
+    raise ValueError(f"Expected 'A' or 'B' for spin selection, got {alpha_or_beta!r}")
 
+
+def _read_cmos_interactive(orbital_file, nbas):
+    """
+    Read a key file's coefficient matrix, prompting for the spin when the file
+    is open-shell.  Returns None (after reporting) if the file is unusable.
+    """
+    try:
+        with open(orbital_file, "r") as file:
+            lines = file.readlines()
+        if len(lines) < 4:
+            raise ValueError("File structure is incorrect or file is too short.")
+        orbital_type = lines[1].strip().split()[0]
+        print(orbital_type, "in AO basis")
+
+        start_line = _prompt_spin_start_line(lines, orbital_file)
+        words = _read_limited_floats(lines, start_line, nbas * nbas)
+        if len(words) % nbas != 0:
+            raise ValueError("Please provide a correct NBO file.\n")
+        num_cmos = int(len(words) / nbas)
+        return np.array(words).reshape(nbas, num_cmos)
+    except ValueError as e:
+        print(e)
+        return None
+
+
+def _parse_orbital_index_spec(text):
+    """
+    Expand an orbital selection such as "1,5,8-12" into a list of 1-based
+    indices.  Raises ValueError on a malformed or descending range.
+    """
+    indices = []
+    for item in text.split(","):
+        if "-" in item:
+            start, end = map(int, item.split("-"))
+            if start > end:
+                raise ValueError("Start of range must be less than end of range.")
+            indices.extend(range(start, end + 1))
+        else:
+            indices.append(int(item))
+    return indices
+
+
+def _prompt_orbital_indices():
+    """Prompt until a valid orbital selection is entered."""
     while True:
         try:
-            orbital_input = input("Enter an orbital index (e.g., 1,5,8-12): ")
-            orbital_index = []
-            for item in orbital_input.split(","):
-                if "-" in item:
-                    start, end = map(int, item.split("-"))
-                    if start > end:
-                        raise ValueError("Start of range must be less than end of range.")
-                    orbital_index.extend(range(start, end + 1))
-                else:
-                    orbital_index.append(int(item))
-            break
+            return _parse_orbital_index_spec(
+                input("Enter an orbital index (e.g., 1,5,8-12): "))
         except ValueError as e:
             print(f"Invalid input: {e}. Please try again.")
 
+
+def _collect_orbital_dict(orbital_files, orbital_index, nbas):
+    """Read the requested orbitals out of each existing key file."""
     orbital_dict = {}
     for orbital_file in orbital_files:
-        if os.path.exists(orbital_file):
-            orbital_arr = get_cmos(orbital_file)
-            if orbital_arr is not None:
-                orbital_dict[orbital_file] = [orbital_arr[i - 1] for i in orbital_index]
-        else:
+        if not os.path.exists(orbital_file):
             print(f"The file {orbital_file} does not exist. Please try again.")
+            continue
+        orbital_arr = _read_cmos_interactive(orbital_file, nbas)
+        if orbital_arr is not None:
+            orbital_dict[orbital_file] = [orbital_arr[i - 1] for i in orbital_index]
+    return orbital_dict
+
+
+def main():
+    filename = input("Enter the filename (.47 recommended or .31): ")
+    file_ext, parsed = _parse_basis_by_extension(filename)
+    basis_info_dict, coordinates, atom_info, _to_bohr = parsed
+
+    basis_info_dict = _normalise_basis_to_molden(basis_info_dict)
+
+    smat = getSmat(basis_info_dict, dict_keys,
+                   normalize_primitives=False, diagonal_only=False)
+    norm_basis_info = normalize_basis_info(basis_info_dict, smat)
+
+    final_norm_basis = _refine_basis_against_overlap(
+        filename, norm_basis_info, smat, file_ext, len(basis_info_dict))
+
+    print('Basis information extracted and renormalized...')
+
+    orbital_files = input(
+        "Enter NBO key files separated by commas: ").replace(" ", "").split(",")
+    orbital_index = _prompt_orbital_indices()
+    orbital_dict = _collect_orbital_dict(
+        orbital_files, orbital_index, len(final_norm_basis))
 
     return {
         'final_norm_basis': final_norm_basis,   # normalised basis function list
@@ -905,6 +1081,44 @@ def load_cmos_headless(key_filepath, orbital_indices, spin='alpha'):
     return [orbital_arr[i - 1] for i in orbital_indices]
 
 
+def _read_limited_floats(lines, start_line, limit):
+    """
+    Collect up to *limit* floats from lines[start_line:], ignoring any token
+    that will not parse as a number.
+    """
+    words = []
+    for line in lines[start_line:]:
+        for elem in line.split():
+            if len(words) >= limit:
+                return words
+            try:
+                words.append(float(elem))
+            except ValueError:
+                pass
+    return words
+
+
+def _beta_start_line(lines):
+    """First data line after the BETA header of an open-shell key file."""
+    for i, line in enumerate(lines):
+        if 'BETA' in line.upper():
+            return i + 1
+    raise ValueError("BETA section not found in open-shell key file")
+
+
+def _cmo_block_start_line(lines, is_open, duplicate_single_block, spin_key):
+    """
+    First data line of the requested spin's coefficient block.
+
+    A closed-shell file -- or an open-shell one whose single block stands for
+    both spins -- starts at line 3.  An open-shell alpha block starts at 4,
+    and beta starts after its own BETA header.
+    """
+    if is_open and spin_key == 'beta' and not duplicate_single_block:
+        return _beta_start_line(lines)
+    return 3 if (not is_open or duplicate_single_block) else 4
+
+
 def _load_cmo_matrix(key_filepath, spin='alpha'):
     spin_key = 'beta' if spin.lower().startswith('b') else 'alpha'
     cache_key = ("cmo_matrix", spin_key, _file_cache_key(key_filepath))
@@ -916,27 +1130,10 @@ def _load_cmo_matrix(key_filepath, spin='alpha'):
         duplicate_single_block = _single_block_open_shell_key(
             lines, key_filepath, is_open=is_open
         )
+        start_line = _cmo_block_start_line(
+            lines, is_open, duplicate_single_block, spin_key)
 
-        if is_open and spin_key == 'beta' and not duplicate_single_block:
-            start_line = None
-            for i, line in enumerate(lines):
-                if 'BETA' in line.upper():
-                    start_line = i + 1
-                    break
-            if start_line is None:
-                raise ValueError("BETA section not found in open-shell key file")
-        else:
-            start_line = 3 if (not is_open or duplicate_single_block) else 4
-
-        words = []
-        for line in lines[start_line:]:
-            for elem in line.split():
-                try:
-                    if len(words) < nbas * nbas:
-                        words.append(float(elem))
-                except ValueError:
-                    pass
-
+        words = _read_limited_floats(lines, start_line, nbas * nbas)
         if len(words) < nbas * nbas:
             raise ValueError(
                 f"Not enough data: expected {nbas*nbas} floats, got {len(words)}"
@@ -1182,77 +1379,12 @@ def compute_cube_data(final_norm_basis, coordinates_ang, atom_info,
          'atom_info': list,     # (Z, x_ang, y_ang, z_ang) tuples
          'bohr_const': float}
     """
-    from angular_funct import ang_res_lamda
-
-    # Try importing the C++ engine; fall back to Python if unavailable
-    try:
-        import electron_density_opt_omp as _cpp_engine
-        _use_cpp = True
-    except ImportError:
-        _use_cpp = False
-
     cmos = precomputed_cmos if precomputed_cmos is not None else load_cmos_headless(key_filepath, orbital_indices, spin)
 
-    # Build uniform grid in bohr
-    coord_bohr = np.array(coordinates_ang) / bohr_const
-    ext_min = coord_bohr.min(axis=0) - ext_dist
-    ext_max = coord_bohr.max(axis=0) + ext_dist
-    ranges  = ext_max - ext_min
-    spc     = ranges[int(np.argmax(ranges))] / (grid_quality - 1)
-    nx = int(round(ranges[0] / spc)) + 1
-    ny = int(round(ranges[1] / spc)) + 1
-    nz = int(round(ranges[2] / spc)) + 1
-    origin  = ext_min
-    spacing = np.array([spc, spc, spc])
-
-    x = np.arange(nx) * spc + origin[0]
-    y = np.arange(ny) * spc + origin[1]
-    z = np.arange(nz) * spc + origin[2]
-    X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
-    points  = np.stack((X, Y, Z), axis=-1).reshape(-1, 3)
-
-    def _eval_python(cmo):
-        """Pure-Python / NumPy vectorised fallback."""
-        density = np.zeros(len(points))
-        for basis, c in zip(final_norm_basis, cmo):
-            if abs(c) <= 1e-15:
-                continue
-            atom_c = coord_bohr[basis['CENTER'] - 1][:, np.newaxis]
-            dx, dy, dz = points.T - atom_c
-            r   = np.sqrt(dx**2 + dy**2 + dz**2)
-            ang = ang_res_lamda(dx, dy, dz, basis['orb_val'])
-            for coeff, zeta in zip(basis['coeffs'], basis['exps']):
-                density += np.round(c * coeff * ang * np.exp(-zeta * r**2), 99)
-        return density.reshape(nx, ny, nz)
-
-    def _eval_cpp(cmo):
-        """C++ OpenMP engine fastest path."""
-        psi = _cpp_engine.electron_density(
-            final_norm_basis, coord_bohr, points, cmo, None)
-        return psi.reshape(nx, ny, nz)
-
-    _eval = _eval_cpp if _use_cpp else _eval_python
-
-    stem    = os.path.splitext(key_filepath)[0]
-    base    = os.path.basename(stem)
-    results = []
-    engine_name = "C++ OpenMP" if _use_cpp else "Python (NumPy)"
-    _t0 = time.time()
-    for cmo, idx in zip(cmos, orbital_indices):
-        grid = _eval(cmo)
-        results.append({
-            'index':      idx,
-            'label':      f"{base}-{idx}",
-            'grid':       grid,
-            'nx': nx, 'ny': ny, 'nz': nz,
-            'spacing':    spacing.copy(),
-            'origin':     origin.copy(),
-            'atom_info':  atom_info,
-            'bohr_const': bohr_const,
-        })
-    print(f"[{engine_name}] total grid generation: {time.time() - _t0:.3f}s "
-          f"for {len(orbital_indices)} orbital(s)")
-    return results
+    return evaluate_orbital_grids(
+        final_norm_basis, coordinates_ang, atom_info, cmos, orbital_indices,
+        os.path.basename(os.path.splitext(key_filepath)[0]),
+        grid_quality, ext_dist, bohr_const)
 
 
 def write_cube_from_result(result_dict, filepath):

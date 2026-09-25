@@ -31,8 +31,8 @@ import re
 import os
 import math
 import copy
-import time
 import numpy as np
+from grid_utils import evaluate_orbital_grids
 from scipy.constants import physical_constants
 from source_cache import ComputationCache, file_cache_key
 
@@ -607,14 +607,6 @@ def compute_cube_data_fchk(fchk_path, orbital_indices, spin,
     Returns the same list-of-dicts format so _load_computed_cubes in
     chemview.py can handle both sources identically.
     """
-    from angular_funct import ang_res_lamda
-
-    try:
-        import electron_density_opt_omp as _cpp
-        _use_cpp = True
-    except ImportError:
-        _use_cpp = False
-
     if precomputed_basis is None:
         final_norm_basis, coordinates_ang, atom_info = load_basis_from_fchk(fchk_path)
     else:
@@ -627,62 +619,10 @@ def compute_cube_data_fchk(fchk_path, orbital_indices, spin,
             orbital_indices = _sort_indices_by_energy(fchk_path, spin=spin, ascending=True)
         cmos = load_cmos_from_fchk(fchk_path, orbital_indices, spin)
 
-    coord_bohr = np.array(coordinates_ang) / bohr_const
-    ext_min    = coord_bohr.min(axis=0) - ext_dist
-    ext_max    = coord_bohr.max(axis=0) + ext_dist
-    ranges     = ext_max - ext_min
-    spc        = ranges[int(np.argmax(ranges))] / (grid_quality - 1)
-    nx = int(round(ranges[0] / spc)) + 1
-    ny = int(round(ranges[1] / spc)) + 1
-    nz = int(round(ranges[2] / spc)) + 1
-    origin  = ext_min
-    spacing = np.array([spc, spc, spc])
-
-    x = np.arange(nx) * spc + origin[0]
-    y = np.arange(ny) * spc + origin[1]
-    z = np.arange(nz) * spc + origin[2]
-    X, Y, Z = np.meshgrid(x, y, z, indexing="ij")
-    points  = np.stack((X, Y, Z), axis=-1).reshape(-1, 3)
-
-    def _eval_python(cmo):
-        density = np.zeros(len(points))
-        for basis, c in zip(final_norm_basis, cmo):
-            if abs(c) <= 1e-15:
-                continue
-            atom_c = coord_bohr[basis["CENTER"] - 1][:, np.newaxis]
-            dx, dy, dz = points.T - atom_c
-            r   = np.sqrt(dx**2 + dy**2 + dz**2)
-            ang = ang_res_lamda(dx, dy, dz, basis["orb_val"])
-            for coeff, zeta in zip(basis["coeffs"], basis["exps"]):
-                density += np.round(c * coeff * ang * np.exp(-zeta * r**2), 99)
-        return density.reshape(nx, ny, nz)
-
-    def _eval_cpp(cmo):
-        psi = _cpp.electron_density(
-            final_norm_basis, coord_bohr, points, cmo, None)
-        return psi.reshape(nx, ny, nz)
-
-    _eval = _eval_cpp if _use_cpp else _eval_python
-
-    base    = os.path.splitext(os.path.basename(fchk_path))[0]
-    results = []
-    engine_name = "C++ OpenMP" if _use_cpp else "Python (NumPy)"
-    _t0 = time.time()
-    for cmo, idx in zip(cmos, orbital_indices):
-        grid = _eval(cmo)
-        results.append({
-            "index":      idx,
-            "label":      f"{base}-{idx}",
-            "grid":       grid,
-            "nx": nx, "ny": ny, "nz": nz,
-            "spacing":    spacing.copy(),
-            "origin":     origin.copy(),
-            "atom_info":  atom_info,
-            "bohr_const": bohr_const,
-        })
-    print(f"[{engine_name}] total grid generation: {time.time() - _t0:.3f}s "
-          f"for {len(orbital_indices)} orbital(s)")
-    return results
+    return evaluate_orbital_grids(
+        final_norm_basis, coordinates_ang, atom_info, cmos, orbital_indices,
+        os.path.splitext(os.path.basename(fchk_path))[0],
+        grid_quality, ext_dist, bohr_const)
 
 def _sort_basis_by_shell_label_order(basis):
     """

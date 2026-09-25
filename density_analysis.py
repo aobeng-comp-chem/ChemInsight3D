@@ -3,6 +3,7 @@ import os
 import numpy as np
 
 from angular_funct import ang_res_lamda
+from grid_utils import build_uniform_grid
 from localization_io import (
     _get_occupation_arrays,
     _num_occupied_from_arrays,
@@ -300,29 +301,9 @@ def nuclear_spin_density(
     return float(densities[0])
 
 
-def _build_uniform_grid(coordinates_ang, grid_quality, ext_dist, bohr_const):
-    """Build a regular Cartesian grid in bohr units for cube generation."""
-    coordinates_ang = np.asarray(coordinates_ang, dtype=float)
-    coordinates_bohr = coordinates_ang / bohr_const
-
-    ext_min = coordinates_bohr.min(axis=0) - ext_dist
-    ext_max = coordinates_bohr.max(axis=0) + ext_dist
-    ranges = ext_max - ext_min
-    spacing = ranges[np.argmax(ranges)] / (grid_quality - 1)
-
-    nx = int(round(ranges[0] / spacing)) + 1
-    ny = int(round(ranges[1] / spacing)) + 1
-    nz = int(round(ranges[2] / spacing)) + 1
-
-    origin = ext_min
-    x = np.arange(nx, dtype=float) * spacing + origin[0]
-    y = np.arange(ny, dtype=float) * spacing + origin[1]
-    z = np.arange(nz, dtype=float) * spacing + origin[2]
-
-    X, Y, Z = np.meshgrid(x, y, z, indexing="ij")
-    points = np.stack((X, Y, Z), axis=-1).reshape(-1, 3)
-
-    return points, (nx, ny, nz), np.array([spacing, spacing, spacing]), origin, coordinates_bohr
+# The grid builder now lives in grid_utils so every cube-producing path
+# (all three source readers plus this module) shares one definition.
+_build_uniform_grid = build_uniform_grid
 
 
 _DENSITY_LABELS = {

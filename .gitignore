@@ -98,6 +98,6 @@ tests/__pycache__/
 tests/tmp_*.py
 .ruff_cache/
 .codex
-
-# Local commit helper
 commit.sh
+pyproject.toml
+

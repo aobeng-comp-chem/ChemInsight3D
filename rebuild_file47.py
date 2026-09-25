@@ -143,13 +143,145 @@ def _find_unhandled_sections(content, handled):
     return sorted({s for s in sections if s.upper() not in handled and s.upper() != "END"})
 
 
+def _validate_contractions(reordered):
+    """Refuse to regenerate $CONTRACT when a function's arrays disagree."""
+    for bf in reordered:
+        if len(bf["exps"]) != len(bf["coeffs"]):
+            raise ValueError(
+                f"Basis function N={bf['N']} has {len(bf['exps'])} exponents "
+                f"but {len(bf['coeffs'])} contraction coefficients -- refusing "
+                "to guess how to regenerate $CONTRACT for this file."
+            )
+
+
+def _warn_unhandled_sections(content, input_path):
+    """Report AO-order-dependent sections this tool drops rather than permute."""
+    handled_keywords = {"GENNBO", "NBO", "COORD", "BASIS", "CONTRACT",
+                        "OVERLAP", "DENSITY", "FOCK"}
+    unhandled = _find_unhandled_sections(content, handled_keywords)
+    if unhandled:
+        print(
+            f"WARNING: {input_path} contains section(s) not understood by this "
+            f"tool -- {', '.join(unhandled)} -- these are AO-order-dependent but "
+            "nbo_read.py never parses them, so their exact permutation convention "
+            "can't be checked here. They are DROPPED from the output rather than "
+            "silently left inconsistent with the new AO ordering."
+        )
+
+
+def _build_basis_block(reordered):
+    """Regenerate $BASIS from the reordered basis functions."""
+    return (
+        " $BASIS\n"
+        + _format_int_array("CENTER", [bf["CENTER"] for bf in reordered])
+        + _format_int_array("LABEL", [bf["LABEL"] for bf in reordered])
+        + " $END\n"
+    )
+
+
+def _pool_primitives(reordered):
+    """
+    Share one primitive block between basis functions with identical
+    exponents and coefficients.
+
+    Real .47 files reuse the same primitive block across multiple shell
+    entries whenever the exponents/coefficients are identical (e.g. the
+    px/py/pz components of one contraction, or repeated angular components
+    of a d/f/g/h shell all point at the same NPTR) -- NCOMP stays 1 per
+    entry, but NPTR duplicates. Skipping that dedup would give every AO its
+    own private copy of the primitives, inflating NEXP several-fold (e.g.
+    3x for p, 5x for d, 7x for f, ...) versus the original file for no
+    numerical benefit, since the values are identical either way.
+
+    Returns (exp_pool, nptr_arr, ptr_cache, nexp_total).
+    """
+    exp_pool = []
+    ptr_cache = {}
+    nptr_arr = []
+    next_ptr = 1
+    for bf in reordered:
+        letter = _angmom_letter(bf["LABEL"])
+        key = (letter, tuple(bf["exps"]), tuple(bf["coeffs"]))
+        ptr = ptr_cache.get(key)
+        if ptr is None:
+            ptr = next_ptr
+            ptr_cache[key] = ptr
+            exp_pool.extend(bf["exps"])
+            next_ptr += len(bf["exps"])
+        nptr_arr.append(ptr)
+    return exp_pool, nptr_arr, ptr_cache, next_ptr - 1
+
+
+def _build_contract_block(reordered, nbas):
+    """Regenerate $CONTRACT in NBO's ungrouped form (NCOMP=1 throughout)."""
+    exp_pool, nptr_arr, ptr_cache, nexp_total = _pool_primitives(reordered)
+
+    coeff_pools = {letter: [0.0] * nexp_total for letter in _COEFF_ARRAY_NAMES}
+    for (letter, exps, coeffs), ptr in ptr_cache.items():
+        coeff_pools[letter][ptr - 1:ptr - 1 + len(exps)] = coeffs
+
+    block = " $CONTRACT\n" + _format_int_array("NSHELL", [nbas])
+    block += _format_int_array("NEXP", [nexp_total])
+    block += _format_int_array("NCOMP", [1] * nbas)
+    block += _format_int_array("NPRIM", [len(bf["exps"]) for bf in reordered])
+    block += _format_int_array("NPTR", nptr_arr)
+    block += _format_float_array("EXP", exp_pool)
+    for letter in ["S", "P", "D", "F", "G", "H"]:
+        block += _format_float_array(_COEFF_ARRAY_NAMES[letter], coeff_pools[letter])
+    block += " $END\n"
+    return block
+
+
+def _packed_values(matrix, perm, nbas, has_upper):
+    """
+    Permute a symmetric AO matrix to the new ordering and flatten it the way
+    the source file stored it.
+
+    UPPER means the file stores the upper triangle packed *column by column*
+    (Fortran convention: outer loop over columns j, inner loop over rows
+    i=1..j). For a symmetric matrix that produces the exact same flat sequence
+    as the lower triangle packed *row by row* in NumPy's row-major layout --
+    which is what np.tril_indices gives. Verified against ground truth:
+    unpacking a real UPPER-flagged $OVERLAP block via tril_indices matches an
+    independently computed overlap matrix to ~1e-7; unpacking the same data
+    via triu_indices does not (this codebase's own
+    create_symmetric_matrix_vectorized reader also assumes tril_indices, so
+    this keeps read/write consistent).
+    """
+    m = matrix[np.ix_(perm, perm)]
+    if not has_upper:
+        return m.reshape(-1)
+    return m[np.tril_indices(nbas)]
+
+
+def _build_matrix_blocks(content, keyword_dict, is_open_shell_data,
+                         perm, nbas, has_upper):
+    """Regenerate $OVERLAP/$DENSITY/$FOCK in the new AO order."""
+    blocks = ""
+    if "$OVERLAP" in content:
+        vals = _packed_values(keyword_dict["OVERLAP"], perm, nbas, has_upper)
+        blocks += " $OVERLAP\n" + _format_bare_float_block(list(vals)) + " $END\n"
+
+    for base_name in ["DENSITY", "FOCK"]:
+        if f"${base_name}" not in content:
+            continue
+        if is_open_shell_data:
+            vals = np.concatenate([
+                _packed_values(keyword_dict[f"{base_name}_ALPHA"], perm, nbas, has_upper),
+                _packed_values(keyword_dict[f"{base_name}_BETA"], perm, nbas, has_upper),
+            ])
+        else:
+            vals = _packed_values(keyword_dict[base_name], perm, nbas, has_upper)
+        blocks += f" ${base_name}\n" + _format_bare_float_block(list(vals)) + " $END\n"
+    return blocks
+
+
 def rebuild_file47(input_path, output_path):
     with open(input_path, "r") as f:
         content = f.read()
 
     header_lines = content.splitlines()
-    header_line = header_lines[0]
-    has_upper = "UPPER" in header_line.upper()
+    has_upper = "UPPER" in header_lines[0].upper()
 
     basis_info, _, _, _ = nbo_read.parse_file47(input_path)
     nbas = len(basis_info)
@@ -165,112 +297,15 @@ def rebuild_file47(input_path, output_path):
     perm = np.array(order)
     reordered = [basis_info[i] for i in order]
 
-    for bf in reordered:
-        if len(bf["exps"]) != len(bf["coeffs"]):
-            raise ValueError(
-                f"Basis function N={bf['N']} has {len(bf['exps'])} exponents "
-                f"but {len(bf['coeffs'])} contraction coefficients -- refusing "
-                "to guess how to regenerate $CONTRACT for this file."
-            )
+    _validate_contractions(reordered)
+    _warn_unhandled_sections(content, input_path)
 
-    handled_keywords = {"GENNBO", "NBO", "COORD", "BASIS", "CONTRACT",
-                        "OVERLAP", "DENSITY", "FOCK"}
-    unhandled = _find_unhandled_sections(content, handled_keywords)
-    if unhandled:
-        print(
-            f"WARNING: {input_path} contains section(s) not understood by this "
-            f"tool -- {', '.join(unhandled)} -- these are AO-order-dependent but "
-            "nbo_read.py never parses them, so their exact permutation convention "
-            "can't be checked here. They are DROPPED from the output rather than "
-            "silently left inconsistent with the new AO ordering."
-        )
-
-    # ---- $BASIS ----
-    center_arr = [bf["CENTER"] for bf in reordered]
-    label_arr = [bf["LABEL"] for bf in reordered]
-    basis_block = (
-        " $BASIS\n"
-        + _format_int_array("CENTER", center_arr)
-        + _format_int_array("LABEL", label_arr)
-        + " $END\n"
-    )
-
-    # ---- $CONTRACT (ungrouped: one independent primitive set per AO) ----
-    nprim_arr = [len(bf["exps"]) for bf in reordered]
-
-    # Real .47 files reuse the same primitive block across multiple shell
-    # entries whenever the exponents/coefficients are identical (e.g. the
-    # px/py/pz components of one contraction, or repeated angular components
-    # of a d/f/g/h shell all point at the same NPTR) -- NCOMP stays 1 per
-    # entry, but NPTR duplicates. Skipping that dedup would give every AO its
-    # own private copy of the primitives, inflating NEXP several-fold (e.g.
-    # 3x for p, 5x for d, 7x for f, ...) versus the original file for no
-    # numerical benefit, since the values are identical either way.
-    exp_pool = []
-    ptr_cache = {}
-    nptr_arr = []
-    next_ptr = 1
-    for bf in reordered:
-        letter = _angmom_letter(bf["LABEL"])
-        key = (letter, tuple(bf["exps"]), tuple(bf["coeffs"]))
-        ptr = ptr_cache.get(key)
-        if ptr is None:
-            ptr = next_ptr
-            ptr_cache[key] = ptr
-            exp_pool.extend(bf["exps"])
-            next_ptr += len(bf["exps"])
-        nptr_arr.append(ptr)
-    nexp_total = next_ptr - 1
-
-    coeff_pools = {letter: [0.0] * nexp_total for letter in _COEFF_ARRAY_NAMES}
-    for (letter, exps, coeffs), ptr in ptr_cache.items():
-        coeff_pools[letter][ptr - 1:ptr - 1 + len(exps)] = coeffs
-
-    contract_block = " $CONTRACT\n" + _format_int_array("NSHELL", [nbas])
-    contract_block += _format_int_array("NEXP", [nexp_total])
-    contract_block += _format_int_array("NCOMP", [1] * nbas)
-    contract_block += _format_int_array("NPRIM", nprim_arr)
-    contract_block += _format_int_array("NPTR", nptr_arr)
-    contract_block += _format_float_array("EXP", exp_pool)
-    for letter in ["S", "P", "D", "F", "G", "H"]:
-        contract_block += _format_float_array(_COEFF_ARRAY_NAMES[letter], coeff_pools[letter])
-    contract_block += " $END\n"
-
-    # ---- $OVERLAP / $DENSITY / $FOCK: permute rows+cols to the new AO order ----
-    def packed_values(matrix):
-        m = matrix[np.ix_(perm, perm)]
-        if not has_upper:
-            return m.reshape(-1)
-        # UPPER means the file stores the upper triangle packed *column by
-        # column* (Fortran convention: outer loop over columns j, inner loop
-        # over rows i=1..j). For a symmetric matrix that produces the exact
-        # same flat sequence as the lower triangle packed *row by row* in
-        # NumPy's row-major layout -- which is what np.tril_indices gives.
-        # Verified against ground truth: unpacking a real UPPER-flagged
-        # $OVERLAP block via tril_indices matches an independently computed
-        # overlap matrix to ~1e-7; unpacking the same data via triu_indices
-        # does not (this codebase's own create_symmetric_matrix_vectorized
-        # reader also assumes tril_indices, so this keeps read/write
-        # consistent).
-        return m[np.tril_indices(nbas)]
+    basis_block = _build_basis_block(reordered)
+    contract_block = _build_contract_block(reordered, nbas)
 
     is_open_shell_data, keyword_dict = nbo_read.process_47_file(input_path, nbas)
-    matrix_blocks = ""
-
-    if "$OVERLAP" in content:
-        vals = packed_values(keyword_dict["OVERLAP"])
-        matrix_blocks += " $OVERLAP\n" + _format_bare_float_block(list(vals)) + " $END\n"
-
-    for base_name in ["DENSITY", "FOCK"]:
-        if f"${base_name}" not in content:
-            continue
-        if is_open_shell_data:
-            alpha_vals = packed_values(keyword_dict[f"{base_name}_ALPHA"])
-            beta_vals = packed_values(keyword_dict[f"{base_name}_BETA"])
-            vals = np.concatenate([alpha_vals, beta_vals])
-        else:
-            vals = packed_values(keyword_dict[base_name])
-        matrix_blocks += f" ${base_name}\n" + _format_bare_float_block(list(vals)) + " $END\n"
+    matrix_blocks = _build_matrix_blocks(
+        content, keyword_dict, is_open_shell_data, perm, nbas, has_upper)
 
     # ---- Assemble: original header/coord verbatim + regenerated blocks ----
     coord_block = _extract_verbatim_block(content, "$COORD")

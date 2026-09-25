@@ -36,8 +36,8 @@ import re
 import os
 import math
 import copy
-import time
 import numpy as np
+from grid_utils import evaluate_orbital_grids
 from scipy.constants import physical_constants
 from source_cache import ComputationCache, file_cache_key
 
@@ -191,29 +191,13 @@ def _parse_atoms(lines):
 # [GTO] parser
 # ────────────────────────────────────────────────────────────────────────────
 
-def _parse_gto(lines, coordinates_bohr):
-    """
-    Parse [GTO] section.
-
-    Returns a list of basis-function dicts using nbo_read field names:
-        N, CENTER, shell_num, type, orb_val, exps, coeffs,
-        xcenter, ycenter, zcenter
-    Coordinates (xcenter etc.) are in Bohr.
-    """
-    gto_idx = _find_section(lines, 'GTO')
-    if gto_idx is None:
-        raise ValueError("No [GTO] section found in molden file.")
-
-    basis = []
-    fn_counter  = 0
-    shell_num   = 0
-    
-        
-    LABEL_MAPPING = {
+# Molden shell tag -> orbital label.  Module level: this is a constant, and it
+# was previously rebuilt (along with its inverse) on every _parse_gto call.
+_LABEL_MAPPING = {
     1: 's', 51: 's',
     101: 'px', 102: 'py', 103: 'pz',
     151: 'px', 152: 'py', 153: 'pz',
-    255: 'd0', 252: 'ds1', 253: 'dc1',  254: 'dc2', 251: 'ds2',    
+    255: 'd0', 252: 'ds1', 253: 'dc1', 254: 'dc2', 251: 'ds2',
     351: 'f0', 352: 'fc1', 353: 'fs1', 354: 'fc2', 355: 'fs2', 356: 'fc3', 357: 'fs3',
     451: 'g0', 452: 'gc1', 453: 'gs1', 454: 'gc2', 455: 'gs2',
     456: 'gc3', 457: 'gs3', 458: 'gc4', 459: 'gs4',
@@ -226,138 +210,168 @@ def _parse_gto(lines, coordinates_bohr):
     756: 'jc3', 757: 'js3', 758: 'jc4', 759: 'js4',
     760: 'jc5', 761: 'js5', 762: 'jc6', 763: 'js6', 764: 'jc7', 765: 'js7',
 }
-    
-    ORBVAL_TO_LABELCODE = {}
-    for code, lbl in LABEL_MAPPING.items():
-        
-        ORBVAL_TO_LABELCODE.setdefault(lbl, code)
 
-    # Determine if pure spherical (5D/7F) or Cartesian
-    pure_spherical = True   # Molden default is spherical for 5D7F flag
-    for i, line in enumerate(lines):
-        if re.match(r'^\s*\[9G\]', line, re.IGNORECASE):
-            pure_spherical = False
-        if re.match(r'^\s*\[Cartesian\]', line, re.IGNORECASE):
-            pure_spherical = False
-        if re.match(r'^\s*\[5D\]', line, re.IGNORECASE):
-            pure_spherical = True
-        if re.match(r'^\s*\[5D7F\]', line, re.IGNORECASE):
-            pure_spherical = True
-        if re.match(r'^\s*\[7F\]', line, re.IGNORECASE):
-            pure_spherical = True
+# Inverse: orbital label -> lowest shell tag that maps to it (setdefault keeps
+# the first, so 's' resolves to 1 rather than 51 and 'px' to 101 rather than 151).
+_ORBVAL_TO_LABELCODE = {}
+for _code, _lbl in _LABEL_MAPPING.items():
+    _ORBVAL_TO_LABELCODE.setdefault(_lbl, _code)
 
+# Shell-header regex: one or two letters naming the shell type (incl. "sp").
+_SHELL_HEADER_RE = re.compile(r'^[spdSPDfFgGhHi]{1,2}$')
+
+
+def _read_shell_primitives(lines, i, n_prim):
+    """
+    Read *n_prim* primitive lines starting at lines[i], skipping blanks and
+    comments.
+
+    Returns (next_index, exps, coeffs, pcoeffs).  pcoeffs holds the third
+    column, which only SP shells populate.  A primitive whose exponent or
+    coefficient will not parse is skipped, matching the original behaviour.
+    """
+    exps, coeffs, pcoeffs = [], [], []
+    pline = ''
+    for _ in range(n_prim):
+        while i < len(lines):
+            pline = lines[i].strip()
+            i += 1
+            if pline and not pline.startswith('#'):
+                break
+        pparts = pline.split()
+        try:
+            exps.append(_fortran_float(pparts[0]))
+            coeffs.append(_fortran_float(pparts[1]))
+            if len(pparts) >= 3:
+                pcoeffs.append(_fortran_float(pparts[2]))
+        except (ValueError, IndexError):
+            continue
+    return i, exps, coeffs, pcoeffs
+
+
+def _shell_components(shell_type, coeffs, pcoeffs):
+    """
+    Expand a shell into its (label, orb_val, coefficients) components.
+
+    Returns None for a shell type with no known component list, which the
+    caller treats as "skip this shell".
+    """
+    if shell_type == 'sp':
+        # s uses the second column, the three p components use the third.
+        p = pcoeffs if pcoeffs else coeffs[:]
+        return [("s", "s", coeffs), ("px", "px", p),
+                ("py", "py", p), ("pz", "pz", p)]
+    labels = _LABEL_MAP.get(shell_type)
+    if labels is None:
+        return None
+    return [(label, orb_val, coeffs) for label, orb_val in labels]
+
+
+def _parse_atom_header(parts, coordinates_bohr, current_idx, current_coords):
+    """
+    Resolve an atom header line to (1-based index, coordinates).
+
+    An unparseable index, or one outside the coordinate list, leaves the current
+    atom unchanged -- as the original inline `except (ValueError, IndexError):
+    pass` did.
+    """
+    try:
+        idx = int(parts[0])
+        return idx, coordinates_bohr[idx - 1]
+    except (ValueError, IndexError):
+        return current_idx, current_coords
+
+
+def _shell_basis_functions(shell_type, exps, coeffs, pcoeffs,
+                           atom_idx, coords, shell_num, first_n):
+    """
+    Build the basis-function dicts for one shell, numbered from *first_n*.
+
+    Returns [] when the shell has no known component list, or when no atom
+    header has been seen yet and there is therefore nowhere to attach the
+    functions -- both cases the caller treats as "skip this shell".
+    """
+    if atom_idx is None or coords is None:
+        return []
+    components = _shell_components(shell_type, coeffs, pcoeffs)
+    if components is None:
+        return []
+    return [{
+        "N":         first_n + offset,
+        "CENTER":    atom_idx,
+        "shell_num": shell_num,
+        "type":      label,
+        "orb_val":   orb_val,
+        "exps":      list(exps),
+        "coeffs":    list(c),
+        "xcenter":   coords[0],
+        "ycenter":   coords[1],
+        "zcenter":   coords[2],
+    } for offset, (label, orb_val, c) in enumerate(components)]
+
+
+def _parse_gto(lines, coordinates_bohr):
+    """
+    Parse [GTO] section.
+
+    Returns a list of basis-function dicts using nbo_read field names:
+        N, CENTER, shell_num, type, orb_val, exps, coeffs,
+        xcenter, ycenter, zcenter
+    Coordinates (xcenter etc.) are in Bohr.
+
+    Note: the [5D]/[5D7F]/[7F] and [9G]/[Cartesian] flags are NOT honoured --
+    every shell is expanded with the pure-spherical component list in
+    _LABEL_MAP.  An earlier version scanned the file for those headers but
+    discarded the result without ever reading it, so this has always been the
+    effective behaviour; a genuinely Cartesian file still needs support adding
+    here.
+    """
+    gto_idx = _find_section(lines, 'GTO')
+    if gto_idx is None:
+        raise ValueError("No [GTO] section found in molden file.")
+
+    basis = []
+    fn_counter = 0
+    shell_num = 0
     current_atom_idx = None   # 1-based
-    current_coords   = None
+    current_coords = None
 
     i = gto_idx + 1
     while i < len(lines):
         line = lines[i]
-
-        # Stop at next section header
-        if re.match(r'^\s*\[', line):
+        if re.match(r'^\s*\[', line):     # next section header
             break
 
         stripped = line.strip()
         i += 1
-
         if not stripped or stripped.startswith('#'):
             continue
-
         parts = stripped.split()
 
         # Atom header line:  "<atom_idx>  0"
         if len(parts) == 2 and parts[1] == '0':
-            try:
-                current_atom_idx = int(parts[0])
-                current_coords   = coordinates_bohr[current_atom_idx - 1]
-            except (ValueError, IndexError):
-                pass
+            current_atom_idx, current_coords = _parse_atom_header(
+                parts, coordinates_bohr, current_atom_idx, current_coords)
             continue
 
         # Shell header line:  "<type> <nprim> <scale>"
-        # type can be s, p, d, f, g, h, sp (case-insensitive)
-        if len(parts) >= 2 and re.match(r'^[spdSPDfFgGhHi]{1,2}$', parts[0]):
-            shell_type = parts[0].lower()
-            try:
-                n_prim = int(parts[1])
-                # scale = float(parts[2]) if len(parts) > 2 else 1.0
-            except ValueError:
-                continue
-
-            shell_num += 1
-
-            # Read n_prim primitive lines
-            exps   = []
-            coeffs = []
-            pcoeffs = []   # for SP shells
-            for _ in range(n_prim):
-                while i < len(lines):
-                    pline = lines[i].strip()
-                    i += 1
-                    if pline and not pline.startswith('#'):
-                        break
-                pparts = pline.split()
-                try:
-                    exps.append(_fortran_float(pparts[0]))
-                    coeffs.append(_fortran_float(pparts[1]))
-                    if len(pparts) >= 3:
-                        pcoeffs.append(_fortran_float(pparts[2]))
-                except (ValueError, IndexError):
-                    continue
-
-            if current_atom_idx is None or current_coords is None:
-                continue
-
-            # Determine component labels
-            if shell_type == 'sp':
-                # SP shell: s component uses coeffs, p components use pcoeffs
-                if not pcoeffs:
-                    pcoeffs = coeffs[:]   # fallback
-                component_pairs = [
-                    ("s",  "s",  coeffs),
-                    ("px", "px", pcoeffs),
-                    ("py", "py", pcoeffs),
-                    ("pz", "pz", pcoeffs),
-                ]
-                for (type, orb_val, c) in component_pairs:
-                    basis.append({
-                        "N":         fn_counter + 1,
-                        "CENTER":    current_atom_idx,
-                        "shell_num": shell_num,
-                        "type":  type,
-                        "orb_val":   orb_val,
-                        "exps":      list(exps),
-                        "coeffs":    list(c),
-                        "xcenter":   current_coords[0],
-                        "ycenter":   current_coords[1],
-                        "zcenter":   current_coords[2],
-                    })
-                    fn_counter += 1
-            else:
-                labels = _LABEL_MAP.get(shell_type)
-                if labels is None:
-                    # Unknown shell type — skip
-                    continue
-                for (type, orb_val) in labels:
-                    basis.append({
-                        "N":         fn_counter + 1,
-                        "CENTER":    current_atom_idx,
-                        "shell_num": shell_num,
-                        "type":  type,
-                        "orb_val":   orb_val,
-                        "exps":      list(exps),
-                        "coeffs":    list(coeffs),
-                        "xcenter":   current_coords[0],
-                        "ycenter":   current_coords[1],
-                        "zcenter":   current_coords[2],
-                    })
-                    fn_counter += 1
+        if not (len(parts) >= 2 and _SHELL_HEADER_RE.match(parts[0])):
             continue
-        
-            
+        try:
+            n_prim = int(parts[1])
+        except ValueError:
+            continue
+
+        shell_num += 1
+        i, exps, coeffs, pcoeffs = _read_shell_primitives(lines, i, n_prim)
+        functions = _shell_basis_functions(
+            parts[0].lower(), exps, coeffs, pcoeffs,
+            current_atom_idx, current_coords, shell_num, fn_counter + 1)
+        basis.extend(functions)
+        fn_counter += len(functions)
+
     for bf in basis:
-        ov = bf["orb_val"]
-        bf["LABEL"] = ORBVAL_TO_LABELCODE.get(ov)    
+        bf["LABEL"] = _ORBVAL_TO_LABELCODE.get(bf["orb_val"])
 
     return basis
 
@@ -365,6 +379,81 @@ def _parse_gto(lines, coordinates_bohr):
 # ────────────────────────────────────────────────────────────────────────────
 # [MO] parser
 # ────────────────────────────────────────────────────────────────────────────
+
+# [MO] block header keywords.  "Sym" has no capture group -- it only marks the
+# start of a new block.
+_MO_HEADER_RES = (
+    ('sym',   re.compile(r'^Sym\s*=', re.IGNORECASE)),
+    ('ene',   re.compile(r'^Ene\s*=\s*(.+)', re.IGNORECASE)),
+    ('spin',  re.compile(r'^Spin\s*=\s*(\S+)', re.IGNORECASE)),
+    ('occup', re.compile(r'^Occup\s*=\s*(.+)', re.IGNORECASE)),
+)
+
+
+def _match_mo_header(stripped):
+    """Return (kind, captured text) for an [MO] header line, else (None, None)."""
+    for kind, regex in _MO_HEADER_RES:
+        match = regex.match(stripped)
+        if match:
+            return kind, (match.group(1).strip() if match.groups() else None)
+    return None, None
+
+
+class _MoBlock:
+    """
+    One [MO] block's header fields and coefficients, accumulated as the block
+    is read.  Coefficients arrive as sparse "<index> <value>" lines, so they
+    are collected in a dict and densified only on flush().
+    """
+
+    __slots__ = ('ene', 'spin', 'occup', 'coeffs')
+
+    def __init__(self):
+        self.ene = None
+        self.spin = None
+        self.occup = None
+        self.coeffs = {}
+
+    def set_header(self, kind, value):
+        if kind == 'ene':
+            self.ene = _fortran_float(value)
+        elif kind == 'spin':
+            self.spin = value
+        elif kind == 'occup':
+            self.occup = _fortran_float(value)
+
+    def add_coefficient(self, stripped):
+        """Absorb a "<index> <value>" line; silently ignore anything else."""
+        parts = stripped.split()
+        if len(parts) != 2:
+            return
+        try:
+            self.coeffs[int(parts[0])] = _fortran_float(parts[1])
+        except ValueError:
+            pass
+
+    def flush(self, buckets, nbas):
+        """
+        Append this block to its spin's bucket.  A block missing Ene= or Spin=
+        is dropped, which is what the original inline _flush() did.
+        """
+        if self.spin is None or self.ene is None:
+            return
+        vec = np.array([self.coeffs.get(k, 0.0) for k in range(1, nbas + 1)])
+        mos, ene, occ = buckets['alpha' if self.spin.lower() == 'alpha' else 'beta']
+        mos.append(vec)
+        ene.append(self.ene)
+        occ.append(self.occup)
+
+
+def _to_mo_arrays(mos, ene, occ):
+    """Stack one spin's collected MOs, or (None, None, None) if there were none."""
+    if not mos:
+        return None, None, None
+    return (np.array(mos),
+            np.array(ene, dtype=float),
+            np.array(occ, dtype=float))
+
 
 def _parse_mo(lines, nbas):
     """
@@ -383,92 +472,28 @@ def _parse_mo(lines, nbas):
     if mo_idx is None:
         raise ValueError("No [MO] section found in molden file.")
 
-    mos_alpha, ene_alpha, occ_alpha = [], [], []
-    mos_beta,  ene_beta,  occ_beta  = [], [], []
-
-    # Each MO block:
-    #   Sym= ...
-    #   Ene= <value>
-    #   Spin= Alpha|Beta
-    #   Occup= <value>
-    #   <index>   <coeff>
-    #   ...  (nbas lines)
-
-    current_ene   = None
-    current_spin  = None
-    current_occup = None
-    current_coeffs = {}   # {1-based index: coeff}
-
-    def _flush():
-        if current_spin is None or current_ene is None:
-            return
-        vec = np.array([current_coeffs.get(k, 0.0) for k in range(1, nbas + 1)])
-        if current_spin.lower() == 'alpha':
-            mos_alpha.append(vec)
-            ene_alpha.append(current_ene)
-            occ_alpha.append(current_occup)
-        else:
-            mos_beta.append(vec)
-            ene_beta.append(current_ene)
-            occ_beta.append(current_occup)
+    # One bucket of (mos, energies, occupations) per spin; 'beta' stays empty
+    # for a closed-shell file and _to_mo_arrays then reports None for it.
+    buckets = {'alpha': ([], [], []), 'beta': ([], [], [])}
+    block = _MoBlock()
 
     for line in _section_lines(lines, mo_idx):
         stripped = line.strip()
         if not stripped:
             continue
+        kind, value = _match_mo_header(stripped)
+        if kind == 'sym':
+            # Sym= opens a new block, so bank the one that just ended.
+            block.flush(buckets, nbas)
+            block = _MoBlock()
+        elif kind is not None:
+            block.set_header(kind, value)
+        else:
+            block.add_coefficient(stripped)
 
-        # New MO block starts when we hit Sym= or Ene= after coefficients
-        m_ene = re.match(r'^Ene\s*=\s*(.+)', stripped, re.IGNORECASE)
-        m_sym = re.match(r'^Sym\s*=', stripped, re.IGNORECASE)
+    block.flush(buckets, nbas)     # the final block has no Sym= after it
 
-        if m_sym:
-            # Flush previous MO if any
-            if current_ene is not None:
-                _flush()
-            current_ene    = None
-            current_spin   = None
-            current_occup  = None
-            current_coeffs = {}
-            continue
-
-        if m_ene:
-            current_ene = _fortran_float(m_ene.group(1).strip())
-            continue
-
-        m_spin = re.match(r'^Spin\s*=\s*(\S+)', stripped, re.IGNORECASE)
-        if m_spin:
-            current_spin = m_spin.group(1).strip()
-            continue
-
-        m_occ = re.match(r'^Occup\s*=\s*(.+)', stripped, re.IGNORECASE)
-        if m_occ:
-            current_occup = _fortran_float(m_occ.group(1).strip())
-            continue
-
-        # Coefficient line:  <index>   <value>
-        parts = stripped.split()
-        if len(parts) == 2:
-            try:
-                idx  = int(parts[0])
-                coef = _fortran_float(parts[1])
-                current_coeffs[idx] = coef
-            except ValueError:
-                pass
-
-    # Flush the last MO
-    if current_ene is not None:
-        _flush()
-
-    def _to_arrays(mos, ene, occ):
-        if not mos:
-            return None, None, None
-        return (np.array(mos),
-                np.array(ene, dtype=float),
-                np.array(occ, dtype=float))
-
-    mo_a, en_a, oc_a = _to_arrays(mos_alpha, ene_alpha, occ_alpha)
-    mo_b, en_b, oc_b = _to_arrays(mos_beta,  ene_beta,  occ_beta)
-    return mo_a, en_a, oc_a, mo_b, en_b, oc_b
+    return _to_mo_arrays(*buckets['alpha']) + _to_mo_arrays(*buckets['beta'])
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -659,14 +684,6 @@ def compute_cube_data_molden(molden_path, orbital_indices, spin,
     Returns the same list-of-dicts so _load_computed_cubes in chemview.py
     handles all three sources identically.
     """
-    from angular_funct import ang_res_lamda
-
-    try:
-        import electron_density_opt_omp as _cpp
-        _use_cpp = True
-    except ImportError:
-        _use_cpp = False
-
     if precomputed_basis is None:
         final_norm_basis, coordinates_ang, atom_info = \
             load_basis_from_molden(molden_path)
@@ -674,81 +691,27 @@ def compute_cube_data_molden(molden_path, orbital_indices, spin,
         final_norm_basis, coordinates_ang, atom_info = precomputed_basis
     cmos = precomputed_cmos if precomputed_cmos is not None else load_cmos_from_molden(molden_path, orbital_indices, spin)
 
-    coord_bohr = np.array(coordinates_ang) / bohr_const
-    ext_min    = coord_bohr.min(axis=0) - ext_dist
-    ext_max    = coord_bohr.max(axis=0) + ext_dist
-    ranges     = ext_max - ext_min
-    spc        = ranges[int(np.argmax(ranges))] / (grid_quality - 1)
-    nx = int(round(ranges[0] / spc)) + 1
-    ny = int(round(ranges[1] / spc)) + 1
-    nz = int(round(ranges[2] / spc)) + 1
-    origin  = ext_min
-    spacing = np.array([spc, spc, spc])
+    return evaluate_orbital_grids(
+        final_norm_basis, coordinates_ang, atom_info, cmos, orbital_indices,
+        os.path.splitext(os.path.basename(molden_path))[0],
+        grid_quality, ext_dist, bohr_const)
 
-    x = np.arange(nx) * spc + origin[0]
-    y = np.arange(ny) * spc + origin[1]
-    z = np.arange(nz) * spc + origin[2]
-    X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
-    points  = np.stack((X, Y, Z), axis=-1).reshape(-1, 3)
 
-    def _eval_python(cmo):
-        density = np.zeros(len(points))
-        for basis, c in zip(final_norm_basis, cmo):
-            if abs(c) <= 1e-15:
-                continue
-            atom_c = coord_bohr[basis['CENTER'] - 1][:, np.newaxis]
-            dx, dy, dz = points.T - atom_c
-            r   = np.sqrt(dx**2 + dy**2 + dz**2)
-            ang = ang_res_lamda(dx, dy, dz, basis['orb_val'])
-            for coeff, zeta in zip(basis['coeffs'], basis['exps']):
-                density += np.round(c * coeff * ang * np.exp(-zeta * r**2), 99)
-        return density.reshape(nx, ny, nz)
-
-    def _eval_cpp(cmo):
-        psi = _cpp.electron_density(
-            final_norm_basis, coord_bohr, points, cmo, None)
-        return psi.reshape(nx, ny, nz)
-
-    _eval = _eval_cpp if _use_cpp else _eval_python
-
-    base    = os.path.splitext(os.path.basename(molden_path))[0]
-    results = []
-    engine_name = "C++ OpenMP" if _use_cpp else "Python (NumPy)"
-    _t0 = time.time()
-    for cmo, idx in zip(cmos, orbital_indices):
-        grid = _eval(cmo)
-        results.append({
-            'index':      idx,
-            'label':      f"{base}-{idx}",
-            'grid':       grid,
-            'nx': nx, 'ny': ny, 'nz': nz,
-            'spacing':    spacing.copy(),
-            'origin':     origin.copy(),
-            'atom_info':  atom_info,
-            'bohr_const': bohr_const,
-        })
-    print(f"[{engine_name}] total grid generation: {time.time() - _t0:.3f}s "
-          f"for {len(orbital_indices)} orbital(s)")
-    return results
+# Molden shell tag -> position within its angular-momentum block.  A table
+# rather than a branch chain: the d block in particular is not in numeric order
+# (255, 252, 253, 254, 251), which is easy to misread as a sequence of ifs.
+_CANONICAL_LABEL_ORDER = {
+    1: 0,                                                    # s
+    101: 0, 102: 1, 103: 2,                                  # p
+    255: 0, 252: 1, 253: 2, 254: 3, 251: 4,                  # d
+    351: 0, 352: 1, 353: 2, 354: 3, 355: 4, 356: 5, 357: 6,  # f
+}
+_CANONICAL_LABEL_UNKNOWN = 999
 
 
 def canonical_label_order(label):
     """Returns position in canonical order for each angular momentum"""
-    if label == 1: return 0
-    if label in [101,102,103]: return label - 101
-    if label == 255: return 0
-    if label == 252: return 1
-    if label == 253: return 2  
-    if label == 254: return 3
-    if label == 251: return 4
-    if label == 351: return 0
-    if label == 352: return 1
-    if label == 353: return 2
-    if label == 354: return 3
-    if label == 355: return 4
-    if label == 356: return 5
-    if label == 357: return 6
-    return 999  # unknown
+    return _CANONICAL_LABEL_ORDER.get(label, _CANONICAL_LABEL_UNKNOWN)
 
 
 

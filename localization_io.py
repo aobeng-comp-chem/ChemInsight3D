@@ -565,6 +565,242 @@ def _fock_diagonal(c, fock):
     return np.einsum('ij,ij->j', c, fock @ c)
 
 
+# Numerical controls for the Pipek-Mezey Jacobi sweeps.
+_PM_GAMMA_TOL = 1.0e-10        # smallest rotation angle worth applying
+_PM_COUPLING_TOL = 1.0e-14     # smallest pair coupling worth rotating on
+_PM_OBJECTIVE_ATOL = 1.0e-12
+_PM_OBJECTIVE_RTOL = 1.0e-10
+_PM_MAX_SWEEPS = 2000
+
+
+def _validate_localization_inputs(cmo, overlap, fock, basis):
+    """Check the AO-basis inputs agree on dimension before any work starts."""
+    if cmo.ndim != 2:
+        raise ValueError(
+            f"cmo must be a two-dimensional array; got shape {cmo.shape}."
+        )
+    n_basis_fn = cmo.shape[0]
+    if overlap.shape != (n_basis_fn, n_basis_fn):
+        raise ValueError(
+            f"overlap must have shape {(n_basis_fn, n_basis_fn)}; "
+            f"got {overlap.shape}."
+        )
+    if fock.shape != (n_basis_fn, n_basis_fn):
+        raise ValueError(
+            f"fock must have shape {(n_basis_fn, n_basis_fn)}; "
+            f"got {fock.shape}."
+        )
+    if len(basis) == 0:
+        raise ValueError("basis must contain at least one atom.")
+
+
+def _range_orbital_window(orbital_range, n_orbitals):
+    """Convert a 1-based inclusive orbital_range to a half-open [lo, hi)."""
+    if orbital_range is None:
+        raise ValueError(
+            "orbital_range=(first, last) is required "
+            "when space='range'."
+        )
+    first, last = orbital_range
+    if not (1 <= first <= last <= n_orbitals):
+        raise ValueError(
+            f"orbital_range {orbital_range} "
+            f"(1-based, inclusive) is out of bounds for "
+            f"{n_orbitals} orbitals."
+        )
+    return first - 1, last
+
+
+def _valence_orbital_window(cmo, overlap, basis, n_occ, core_threshold):
+    """
+    Half-open window covering the outer/valence part of the occupied space.
+
+    Returns None when every occupied orbital already meets core_threshold, so
+    there is no valence block to localize.  The core orbitals are left
+    untouched and are not part of the caller's output, same as any orbital
+    outside the requested space.
+    """
+    valence_start = find_valence_start(
+        cmo, overlap, basis, n_occ, core_threshold=core_threshold
+    )
+    if valence_start >= n_occ:
+        print(
+            f"All {n_occ} occupied orbitals meet the core threshold "
+            f"({core_threshold:.0%} single-atom population) -- "
+            "no valence orbitals to localize."
+        )
+        return None
+    return valence_start, n_occ
+
+
+def _select_orbital_window(space, cmo, overlap, basis, n_orbitals,
+                           n_occ, orbital_range, core_threshold):
+    """
+    Resolve the requested subspace to a half-open orbital window [lo, hi).
+
+    Returns None only for space='occupied_valence' with no valence block.
+    """
+    if space in ("occupied", "virtual", "occupied_valence") and n_occ is None:
+        raise ValueError(
+            f"n_occ is required when space={space!r}."
+        )
+
+    if space == "occupied":
+        return 0, n_occ
+    if space == "virtual":
+        return n_occ, n_orbitals
+    if space == "range":
+        return _range_orbital_window(orbital_range, n_orbitals)
+    if space == "occupied_valence":
+        return _valence_orbital_window(
+            cmo, overlap, basis, n_occ, core_threshold)
+    raise ValueError(
+        f"Unknown orbital space: {space!r}; expected "
+        "'occupied', 'virtual', 'range', or 'occupied_valence'."
+    )
+
+
+class _JacobiWorkspace:
+    """
+    Buffers reused by every orbital pair in a sweep.
+
+    Preallocating these keeps the pair loop free of per-rotation allocations,
+    which dominate the runtime for a large basis.
+    """
+
+    __slots__ = ('rotated_c_s', 'rotated_c_t', 'rotated_sc_s', 'rotated_sc_t',
+                 'cross_ao', 'cross_ao_tmp')
+
+    def __init__(self, n_basis_fn, c, sc):
+        self.rotated_c_s = np.empty(n_basis_fn, dtype=c.dtype)
+        self.rotated_c_t = np.empty(n_basis_fn, dtype=c.dtype)
+        self.rotated_sc_s = np.empty(n_basis_fn, dtype=sc.dtype)
+        self.rotated_sc_t = np.empty(n_basis_fn, dtype=sc.dtype)
+        self.cross_ao = np.empty(
+            n_basis_fn, dtype=np.result_type(c.dtype, sc.dtype))
+        self.cross_ao_tmp = np.empty_like(self.cross_ao)
+
+
+def _pair_cross_population(c, sc, s, t, work, reduce_by_atom):
+    """
+    Symmetrized AO cross-population, reduced over atoms:
+
+        q_st[A] = sum_{mu in A} 0.5 * (C[mu,t] SC[mu,s] + C[mu,s] SC[mu,t])
+    """
+    np.multiply(c[:, t], sc[:, s], out=work.cross_ao)
+    np.multiply(c[:, s], sc[:, t], out=work.cross_ao_tmp)
+    work.cross_ao += work.cross_ao_tmp
+    work.cross_ao *= 0.5
+    return reduce_by_atom(work.cross_ao)
+
+
+def _jacobi_angle(qas, qat, qast):
+    """
+    Pipek-Mezey 2x2 rotation angle for one orbital pair.
+
+    Returns None when the pair is already stationary -- either the coupling is
+    below _PM_COUPLING_TOL, or the resulting angle is below _PM_GAMMA_TOL.
+    """
+    population_difference = qas - qat
+    ast = (np.dot(qast, qast)
+           - 0.25 * np.dot(population_difference, population_difference))
+    bst = np.dot(qast, population_difference)
+
+    denominator = np.hypot(ast, bst)
+    if denominator < _PM_COUPLING_TOL:
+        return None
+
+    cos_arg = np.clip(-ast / denominator, -1.0, 1.0)
+    gamma = 0.25 * np.arccos(cos_arg) * np.sign(bst)
+    if abs(gamma) <= _PM_GAMMA_TOL:
+        return None
+    return gamma
+
+
+def _apply_jacobi_rotation(c, sc, atomic_populations, s, t, gamma,
+                           qas, qat, qast, work):
+    """
+    Rotate columns s and t of C and SC, and update the two affected
+    atomic-population columns in place:
+
+        q_s' = cos²(gamma) q_s + sin²(gamma) q_t + 2 cos(gamma) sin(gamma) q_st
+        q_t' = sin²(gamma) q_s + cos²(gamma) q_t - 2 cos(gamma) sin(gamma) q_st
+    """
+    cosg = np.cos(gamma)
+    sing = np.sin(gamma)
+
+    np.multiply(c[:, s], cosg, out=work.rotated_c_s)
+    work.rotated_c_s += c[:, t] * sing
+    np.multiply(c[:, t], cosg, out=work.rotated_c_t)
+    work.rotated_c_t -= c[:, s] * sing
+    c[:, s] = work.rotated_c_s
+    c[:, t] = work.rotated_c_t
+
+    np.multiply(sc[:, s], cosg, out=work.rotated_sc_s)
+    work.rotated_sc_s += sc[:, t] * sing
+    np.multiply(sc[:, t], cosg, out=work.rotated_sc_t)
+    work.rotated_sc_t -= sc[:, s] * sing
+    sc[:, s] = work.rotated_sc_s
+    sc[:, t] = work.rotated_sc_t
+
+    cosg2 = cosg * cosg
+    sing2 = sing * sing
+    two_cos_sin = 2.0 * cosg * sing
+    atomic_populations[:, s] = cosg2 * qas + sing2 * qat + two_cos_sin * qast
+    atomic_populations[:, t] = sing2 * qas + cosg2 * qat - two_cos_sin * qast
+
+
+def _jacobi_sweep(c, sc, atomic_populations, n_sel, rng, work, reduce_by_atom):
+    """
+    Run one full sweep over ordered orbital pairs; returns the rotation count.
+
+    s is visited in a random order and t in normal index order, which is the
+    pair ordering the original implementation used.  The pairs are generated
+    lazily rather than materialised as a list.
+    """
+    rotations = 0
+    for s in rng.permutation(n_sel):
+        for t in range(n_sel):
+            if t == s:
+                continue
+            # The atomic populations are maintained throughout the sweep, so
+            # they never have to be recomputed from the AO coefficients here.
+            qas = atomic_populations[:, s].copy()
+            qat = atomic_populations[:, t].copy()
+            qast = _pair_cross_population(c, sc, s, t, work, reduce_by_atom)
+
+            gamma = _jacobi_angle(qas, qat, qast)
+            if gamma is None:
+                continue
+
+            _apply_jacobi_rotation(c, sc, atomic_populations, s, t, gamma,
+                                   qas, qat, qast, work)
+            rotations += 1
+    return rotations
+
+
+def _pipek_mezey_objective(atomic_populations):
+    """L_PM = sum_A sum_i q[A, i]^2."""
+    return float(np.einsum("ai,ai->", atomic_populations,
+                           atomic_populations, optimize=True))
+
+
+def _report_localization(converged, final_sweep, current_objective,
+                         objective_change, total_rotations, elapsed_time,
+                         loc_energy):
+    """Print the same convergence summary the inline code emitted."""
+    if converged:
+        print(f"Localization converged after {final_sweep} sweeps.")
+    else:
+        print(f"Localization not converged after "
+              f"{_PM_MAX_SWEEPS} sweeps.")
+    print(f"Pipek-Mezey objective: {current_objective:.15g}")
+    print(f"Objective change: {objective_change:.3e}")
+    print(f"Jacobi rotations: {total_rotations}")
+    print(f"Localization runtime: {elapsed_time:.6f} seconds")
+    print(f"Energy of localized orbitals:\n{loc_energy}\n")
+
+
 def localize_orbitals(
     cmo,
     overlap,
@@ -646,139 +882,26 @@ def localize_orbitals(
     overlap = np.asarray(overlap)
     fock = np.asarray(fock)
 
-    if cmo.ndim != 2:
-        raise ValueError(
-            f"cmo must be a two-dimensional array; got shape {cmo.shape}."
-        )
-
+    _validate_localization_inputs(cmo, overlap, fock, basis)
     n_basis_fn, n_orbitals = cmo.shape
 
-    if overlap.shape != (n_basis_fn, n_basis_fn):
-        raise ValueError(
-            f"overlap must have shape {(n_basis_fn, n_basis_fn)}; "
-            f"got {overlap.shape}."
-        )
-
-    if fock.shape != (n_basis_fn, n_basis_fn):
-        raise ValueError(
-            f"fock must have shape {(n_basis_fn, n_basis_fn)}; "
-            f"got {fock.shape}."
-        )
-
-    if len(basis) == 0:
-        raise ValueError("basis must contain at least one atom.")
-
-    # ---------------------------------------------------------------
-    # Select the requested orbital subspace.
-    # ---------------------------------------------------------------
-    if space == "occupied":
-        if n_occ is None:
-            raise ValueError(
-                "n_occ is required when space='occupied'."
-            )
-
-        lo, hi = 0, n_occ
-
-    elif space == "virtual":
-        if n_occ is None:
-            raise ValueError(
-                "n_occ is required when space='virtual'."
-            )
-
-        lo, hi = n_occ, n_orbitals
-
-    elif space == "range":
-        if orbital_range is None:
-            raise ValueError(
-                "orbital_range=(first, last) is required "
-                "when space='range'."
-            )
-
-        first, last = orbital_range
-
-        if not (1 <= first <= last <= n_orbitals):
-            raise ValueError(
-                f"orbital_range {orbital_range} "
-                f"(1-based, inclusive) is out of bounds for "
-                f"{n_orbitals} orbitals."
-            )
-
-        lo, hi = first - 1, last
-
-    elif space == "occupied_valence":
-        if n_occ is None:
-            raise ValueError(
-                "n_occ is required when space='occupied_valence'."
-            )
-
-        valence_start = find_valence_start(
-            cmo, overlap, basis, n_occ, core_threshold=core_threshold
-        )
-
-        if valence_start >= n_occ:
-            # Every occupied orbital already meets core_threshold -- there
-            # is no valence block to localize. The core orbitals are left
-            # untouched and are NOT part of this call's output (same as
-            # they wouldn't be for any other space selection).
-            print(
-                f"All {n_occ} occupied orbitals meet the core threshold "
-                f"({core_threshold:.0%} single-atom population) -- "
-                "no valence orbitals to localize."
-            )
-            return cmo[:, :0].copy(), np.empty(0, dtype=float)
-
-        lo, hi = valence_start, n_occ
-
-    else:
-        raise ValueError(
-            f"Unknown orbital space: {space!r}; expected "
-            "'occupied', 'virtual', 'range', or 'occupied_valence'."
-        )
+    window = _select_orbital_window(
+        space, cmo, overlap, basis, n_orbitals,
+        n_occ, orbital_range, core_threshold)
+    if window is None:      # occupied_valence with an all-core occupied space
+        return cmo[:, :0].copy(), np.empty(0, dtype=float)
+    lo, hi = window
 
     if not (0 <= lo < hi <= n_orbitals):
         raise ValueError(
             f"Orbital selection [{lo}, {hi}) is out of bounds "
             f"for {n_orbitals} orbitals."
         )
-
     n_sel = hi - lo
-    natom = len(basis)
-
-    # ---------------------------------------------------------------
-    # Numerical controls.
-    # ---------------------------------------------------------------
-    gamma_tol = 1.0e-10
-    coupling_tol = 1.0e-14
-
-    objective_atol = 1.0e-12
-    objective_rtol = 1.0e-10
-
-    max_sweeps = 2000
 
     # reduce_by_atom(values) sums an AO-indexed array over each atom's
     # basis functions via np.add.reduceat -- see _prepare_atom_grouping().
     reduce_by_atom = _prepare_atom_grouping(basis, n_basis_fn)
-
-    def calculate_atomic_populations(coefficients, overlap_coefficients):
-        """
-        Return q[A, i] for every atom A and selected orbital i.
-        """
-        return reduce_by_atom(
-            coefficients * overlap_coefficients
-        )
-
-    def pipek_mezey_objective(atomic_populations):
-        """
-        Calculate sum_A sum_i q[A, i]^2.
-        """
-        return float(
-            np.einsum(
-                "ai,ai->",
-                atomic_populations,
-                atomic_populations,
-                optimize=True,
-            )
-        )
 
     # ---------------------------------------------------------------
     # Initialize the selected orbital space.
@@ -786,31 +909,13 @@ def localize_orbitals(
     c = cmo[:, lo:hi].copy()
     sc = overlap @ c
 
-    atomic_populations = calculate_atomic_populations(c, sc)
-
-    prev_objective = pipek_mezey_objective(
-        atomic_populations
-    )
-
+    atomic_populations = reduce_by_atom(c * sc)
+    prev_objective = _pipek_mezey_objective(atomic_populations)
     current_objective = prev_objective
     objective_change = 0.0
 
     rng = np.random.default_rng(seed)
-
-    # Preallocated work arrays avoid repeated allocations in the
-    # orbital-pair loop.
-    rotated_c_s = np.empty(n_basis_fn, dtype=c.dtype)
-    rotated_c_t = np.empty(n_basis_fn, dtype=c.dtype)
-
-    rotated_sc_s = np.empty(n_basis_fn, dtype=sc.dtype)
-    rotated_sc_t = np.empty(n_basis_fn, dtype=sc.dtype)
-
-    cross_ao = np.empty(
-        n_basis_fn,
-        dtype=np.result_type(c.dtype, sc.dtype),
-    )
-
-    cross_ao_tmp = np.empty_like(cross_ao)
+    work = _JacobiWorkspace(n_basis_fn, c, sc)
 
     total_rotations = 0
     converged = False
@@ -819,192 +924,23 @@ def localize_orbitals(
     # ---------------------------------------------------------------
     # Sequential Jacobi sweeps.
     # ---------------------------------------------------------------
-    for sweep in range(1, max_sweeps + 1):
+    for sweep in range(1, _PM_MAX_SWEEPS + 1):
         final_sweep = sweep
-        rotations_this_sweep = 0
+        rotations_this_sweep = _jacobi_sweep(
+            c, sc, atomic_populations, n_sel, rng, work, reduce_by_atom)
 
-        random_s = rng.permutation(n_sel)
-
-        # This preserves the pair ordering used by the original code:
-        # s is randomized and t is visited in normal index order.
-        #
-        # The pairs are generated lazily rather than building a large
-        # Python list.
-        for s in random_s:
-            for t in range(n_sel):
-                if t == s:
-                    continue
-
-                # Atomic populations q_A(s) and q_A(t) are maintained
-                # throughout the sweep, so they do not need to be
-                # recalculated from the AO coefficients.
-                qas = atomic_populations[:, s].copy()
-                qat = atomic_populations[:, t].copy()
-
-                # Compute the symmetrized AO cross-population:
-                #
-                # 0.5 * [
-                #     C[:, t] * SC[:, s]
-                #     + C[:, s] * SC[:, t]
-                # ]
-                np.multiply(
-                    c[:, t],
-                    sc[:, s],
-                    out=cross_ao,
-                )
-
-                np.multiply(
-                    c[:, s],
-                    sc[:, t],
-                    out=cross_ao_tmp,
-                )
-
-                cross_ao += cross_ao_tmp
-                cross_ao *= 0.5
-
-                # Vectorized reduction over atoms.
-                qast = reduce_by_atom(cross_ao)
-
-                population_difference = qas - qat
-
-                ast = (
-                    np.dot(qast, qast)
-                    - 0.25
-                    * np.dot(
-                        population_difference,
-                        population_difference,
-                    )
-                )
-
-                bst = np.dot(
-                    qast,
-                    population_difference,
-                )
-
-                denominator = np.hypot(ast, bst)
-
-                if denominator < coupling_tol:
-                    continue
-
-                cos_arg = np.clip(
-                    -ast / denominator,
-                    -1.0,
-                    1.0,
-                )
-
-                gamma = (
-                    0.25
-                    * np.arccos(cos_arg)
-                    * np.sign(bst)
-                )
-
-                if abs(gamma) <= gamma_tol:
-                    continue
-
-                cosg = np.cos(gamma)
-                sing = np.sin(gamma)
-
-                # Save these values because they are also needed for the
-                # atomic-population update.
-                cosg2 = cosg * cosg
-                sing2 = sing * sing
-                two_cos_sin = 2.0 * cosg * sing
-
-                # ---------------------------------------------------
-                # Rotate C.
-                # ---------------------------------------------------
-                np.multiply(
-                    c[:, s],
-                    cosg,
-                    out=rotated_c_s,
-                )
-
-                rotated_c_s += c[:, t] * sing
-
-                np.multiply(
-                    c[:, t],
-                    cosg,
-                    out=rotated_c_t,
-                )
-
-                rotated_c_t -= c[:, s] * sing
-
-                c[:, s] = rotated_c_s
-                c[:, t] = rotated_c_t
-
-                # ---------------------------------------------------
-                # Rotate S C using the same Jacobi rotation.
-                # ---------------------------------------------------
-                np.multiply(
-                    sc[:, s],
-                    cosg,
-                    out=rotated_sc_s,
-                )
-
-                rotated_sc_s += sc[:, t] * sing
-
-                np.multiply(
-                    sc[:, t],
-                    cosg,
-                    out=rotated_sc_t,
-                )
-
-                rotated_sc_t -= sc[:, s] * sing
-
-                sc[:, s] = rotated_sc_s
-                sc[:, t] = rotated_sc_t
-
-                # ---------------------------------------------------
-                # Update only the two affected population columns.
-                #
-                # q_s' = cos²(gamma) q_s
-                #      + sin²(gamma) q_t
-                #      + 2 cos(gamma) sin(gamma) q_st
-                #
-                # q_t' = sin²(gamma) q_s
-                #      + cos²(gamma) q_t
-                #      - 2 cos(gamma) sin(gamma) q_st
-                # ---------------------------------------------------
-                atomic_populations[:, s] = (
-                    cosg2 * qas
-                    + sing2 * qat
-                    + two_cos_sin * qast
-                )
-
-                atomic_populations[:, t] = (
-                    sing2 * qas
-                    + cosg2 * qat
-                    - two_cos_sin * qast
-                )
-
-                rotations_this_sweep += 1
-                total_rotations += 1
-
-        # Recompute the atomic populations from C and S C after each
-        # complete sweep. This removes accumulated floating-point drift
-        # from the incremental population updates.
-        atomic_populations = calculate_atomic_populations(
-            c,
-            sc,
-        )
-
-        current_objective = pipek_mezey_objective(
-            atomic_populations
-        )
-
-        objective_change = (
-            current_objective - prev_objective
-        )
+        # Recompute the atomic populations from C and S C after each complete
+        # sweep. This removes accumulated floating-point drift from the
+        # incremental population updates.
+        atomic_populations = reduce_by_atom(c * sc)
+        current_objective = _pipek_mezey_objective(atomic_populations)
+        objective_change = current_objective - prev_objective
 
         convergence_threshold = (
-            objective_atol
-            + objective_rtol
-            * max(
-                abs(prev_objective),
-                abs(current_objective),
-            )
+            _PM_OBJECTIVE_ATOL
+            + _PM_OBJECTIVE_RTOL * max(abs(prev_objective),
+                                       abs(current_objective))
         )
-
         if abs(objective_change) <= convergence_threshold:
             converged = True
             break
@@ -1025,39 +961,9 @@ def localize_orbitals(
     sorted_c = c[:, sort_energy_indices]
     loc_energy = unsorted_energy[sort_energy_indices]
 
-    elapsed_time = time.perf_counter() - start_time
-
-    if converged:
-        print(
-            f"Localization converged after {final_sweep} sweeps."
-        )
-    else:
-        print(
-            f"Localization not converged after "
-            f"{max_sweeps} sweeps."
-        )
-
-    print(
-        f"Pipek-Mezey objective: "
-        f"{current_objective:.15g}"
-    )
-
-    print(
-        f"Objective change: {objective_change:.3e}"
-    )
-
-    print(
-        f"Jacobi rotations: {total_rotations}"
-    )
-
-    print(
-        f"Localization runtime: {elapsed_time:.6f} seconds"
-    )
-
-    print(
-        f"Energy of localized orbitals:\n"
-        f"{loc_energy}\n"
-    )
+    _report_localization(
+        converged, final_sweep, current_objective, objective_change,
+        total_rotations, time.perf_counter() - start_time, loc_energy)
 
     return sorted_c, loc_energy
 
@@ -1191,6 +1097,80 @@ def _localize_orbitals_with_fallback(
     )
 
 
+def _load_source_basis(path, source_type):
+    """
+    Load the basis for a localization source, plus the NBO key-file path when
+    the format needs one.
+
+    Returns (key_path, final_basis, coordinates_ang, atom_info).
+    """
+    if source_type == "nbo":
+        key_path = os.path.splitext(path)[0] + ".40"
+        if not os.path.exists(key_path):
+            raise FileNotFoundError(
+                f"NBO orbital localization requires a sibling .40 key file "
+                f"(the canonical AO-basis MOs) -- expected {key_path}."
+            )
+        import nbo_read as _nr
+        basis, coordinates_ang, atom_info = _nr.load_basis_headless(path)
+        return key_path, basis, coordinates_ang, atom_info
+
+    if source_type == "fchk":
+        import fchk_read as _fr
+        basis, coordinates_ang, atom_info = _fr.load_basis_from_fchk(path)
+        return None, basis, coordinates_ang, atom_info
+
+    if source_type == "molden":
+        import read_molden as _mr
+        basis, coordinates_ang, atom_info = _mr.load_basis_from_molden(path)
+        return None, basis, coordinates_ang, atom_info
+
+    raise ValueError(f"Unrecognized source file: {path}")
+
+
+def _localized_occupations(space, n_sel, is_open_shell):
+    """
+    Per-orbital occupations for a localized set, or None where the selection
+    leaves them ill-defined.
+    """
+    if space in ("occupied", "occupied_valence"):
+        # Closed-shell orbitals hold 2 electrons each; open-shell spin-
+        # orbitals (each spin solved independently) hold exactly 1.
+        return np.full(n_sel, 1.0 if is_open_shell else 2.0)
+    if space == "virtual":
+        return np.full(n_sel, 0.0)
+    # A 'range' selection may straddle the occ/virt boundary, where
+    # per-orbital occupation isn't well-defined here.
+    return None
+
+
+def _compute_source_cubes(source_type, path, final_basis, coordinates_ang,
+                          atom_info, orbital_indices, cmos_rows, spin,
+                          grid_quality, ext_dist, bohr_const):
+    """Dispatch cube generation to the reader that owns this source format."""
+    if source_type == "nbo":
+        import nbo_read as _nr
+        return _nr.compute_cube_data(
+            final_basis, coordinates_ang, atom_info,
+            orbital_indices, path, spin,
+            grid_quality, ext_dist, bohr_const,
+            precomputed_cmos=cmos_rows,
+        )
+    if source_type == "fchk":
+        import fchk_read as _fr
+        return _fr.compute_cube_data_fchk(
+            path, orbital_indices, spin, grid_quality, ext_dist, bohr_const,
+            precomputed_cmos=cmos_rows,
+            precomputed_basis=(final_basis, coordinates_ang, atom_info),
+        )
+    import read_molden as _mr
+    return _mr.compute_cube_data_molden(
+        path, orbital_indices, spin, grid_quality, ext_dist, bohr_const,
+        precomputed_cmos=cmos_rows,
+        precomputed_basis=(final_basis, coordinates_ang, atom_info),
+    )
+
+
 def compute_localized_cube_data(
     path,
     spin="alpha",
@@ -1253,29 +1233,8 @@ def compute_localized_cube_data(
         space           : echoed back, for convenience.
     """
     source_type = _recognize_source_type(path)
-
-    if source_type == "nbo":
-        key_path = os.path.splitext(path)[0] + ".40"
-        if not os.path.exists(key_path):
-            raise FileNotFoundError(
-                f"NBO orbital localization requires a sibling .40 key file "
-                f"(the canonical AO-basis MOs) -- expected {key_path}."
-            )
-        import nbo_read as _nr
-        final_basis, coordinates_ang, atom_info = _nr.load_basis_headless(path)
-
-    elif source_type == "fchk":
-        key_path = None
-        import fchk_read as _fr
-        final_basis, coordinates_ang, atom_info = _fr.load_basis_from_fchk(path)
-
-    elif source_type == "molden":
-        key_path = None
-        import read_molden as _mr
-        final_basis, coordinates_ang, atom_info = _mr.load_basis_from_molden(path)
-
-    else:
-        raise ValueError(f"Unrecognized source file: {path}")
+    key_path, final_basis, coordinates_ang, atom_info = _load_source_basis(
+        path, source_type)
 
     cmo, overlap, final_basis = get_localization_inputs(path, key_path=key_path, spin=spin)
     fock = get_fock_matrix(path, key_path=key_path, spin=spin, cmo=cmo, overlap=overlap)
@@ -1304,36 +1263,11 @@ def compute_localized_cube_data(
     orbital_indices = list(range(1, n_sel + 1))
     cmos_rows = list(localized_cmo.T)
 
-    if space in ("occupied", "occupied_valence"):
-        # Closed-shell orbitals hold 2 electrons each; open-shell spin-
-        # orbitals (each spin solved independently) hold exactly 1.
-        occupations = np.full(n_sel, 1.0 if is_open_shell else 2.0)
-    elif space == "virtual":
-        occupations = np.full(n_sel, 0.0)
-    else:
-        # A 'range' selection may straddle the occ/virt boundary, where
-        # per-orbital occupation isn't well-defined here.
-        occupations = None
+    occupations = _localized_occupations(space, n_sel, is_open_shell)
 
-    if source_type == "nbo":
-        cubes = _nr.compute_cube_data(
-            final_basis, coordinates_ang, atom_info,
-            orbital_indices, path, spin,
-            grid_quality, ext_dist, bohr_const,
-            precomputed_cmos=cmos_rows,
-        )
-    elif source_type == "fchk":
-        cubes = _fr.compute_cube_data_fchk(
-            path, orbital_indices, spin, grid_quality, ext_dist, bohr_const,
-            precomputed_cmos=cmos_rows,
-            precomputed_basis=(final_basis, coordinates_ang, atom_info),
-        )
-    else:
-        cubes = _mr.compute_cube_data_molden(
-            path, orbital_indices, spin, grid_quality, ext_dist, bohr_const,
-            precomputed_cmos=cmos_rows,
-            precomputed_basis=(final_basis, coordinates_ang, atom_info),
-        )
+    cubes = _compute_source_cubes(
+        source_type, path, final_basis, coordinates_ang, atom_info,
+        orbital_indices, cmos_rows, spin, grid_quality, ext_dist, bohr_const)
 
     base = os.path.splitext(os.path.basename(path))[0]
     for i, cube in enumerate(cubes, start=1):

@@ -6,6 +6,7 @@ import math
 import json
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from itertools import combinations
 from path_utils import default_dir as _default_dir, remember_dir as _remember_dir, normalize_path_for_runtime as _normalize_path
 from PyQt5.QtWidgets import (
@@ -111,6 +112,40 @@ GRID_LINES_V = 12
 # spheres and bond tubes remain visually round at close zoom.
 ATOM_SPHERE_RESOLUTION = 64
 BOND_TUBE_SIDES = 48
+
+
+# ── Grid quality presets ──────────────────────────────────────────────────────
+# (combo label, grid points along the widest axis). This single table drives
+# both the combo items and the point-count lookup, so the two cannot drift
+# apart -- they previously did: every dialog offered six presets while most of
+# the duplicated {0: 50, 1: 75, 2: 100, 3: 125} lookups only covered four, so
+# choosing "Ultra-Fine" or "Super-Ultra-Fine" raised KeyError.
+GRID_QUALITY_PRESETS = (
+    ("Low     (50 pts)",            50),
+    ("Medium  (75 pts)",            75),
+    ("Fine    (100 pts)",          100),
+    ("Ultra   (125 pts)",          125),
+    ("Ultra-Fine (150 pts)",       150),
+    ("Super-Ultra-Fine (200 pts)", 200),
+)
+GRID_QUALITY_DEFAULT_INDEX = 2      # "Fine (100 pts)"
+
+
+def make_grid_quality_combo():
+    """Build the grid-quality combo, carrying each preset's point count as item data."""
+    combo = QComboBox()
+    for label, points in GRID_QUALITY_PRESETS:
+        combo.addItem(label, points)
+    combo.setCurrentIndex(GRID_QUALITY_DEFAULT_INDEX)
+    return combo
+
+
+def grid_quality_of(combo):
+    """Point count for *combo*'s current selection."""
+    points = combo.currentData()
+    if points is None:      # combo built without item data, or nothing selected
+        points = GRID_QUALITY_PRESETS[GRID_QUALITY_DEFAULT_INDEX][1]
+    return int(points)
 
 
 
@@ -448,6 +483,104 @@ def _population_report_text(population):
     return "\n".join(lines)
 
 
+def _population_orbital_energies(c, fock, energies, nloc):
+    """Orbital energies for the population report: from F, or given, or NaN."""
+    if fock is not None:
+        return np.diag(c.T @ fock @ c)
+    if energies is not None:
+        return np.asarray(energies, dtype=float)
+    return np.full(nloc, np.nan)
+
+
+def _population_occupations(orb_occ, nloc):
+    """Occupations as a 1-D float array; a density matrix is reduced to its diagonal."""
+    if orb_occ is None:
+        return np.full(nloc, np.nan)
+    occ = np.asarray(orb_occ)
+    if occ.ndim == 2:
+        occ = np.diag(occ)
+    return occ.astype(float)
+
+
+def _atom_angmom_contribs(c, sc, col, indices_by_angmom):
+    """
+    Per-angular-momentum share of one atom's population on one orbital,
+    expressed as percentages of the atom's total absolute contribution.
+    """
+    contribs = {}
+    abs_total = 0.0
+    for angmom, indices in indices_by_angmom.items():
+        qas_ang = 0.0
+        for u in indices:
+            qas_ang += c[u, col] * sc[u, col]
+        contribs[angmom] = abs(qas_ang)
+        abs_total += abs(qas_ang)
+    if abs_total > 1.0e-8:
+        for angmom in contribs:
+            contribs[angmom] = 100.0 * contribs[angmom] / abs_total
+    return contribs
+
+
+def _atom_population_contribs(c, sc, col, atom_ranges, atom_angmom_ranges):
+    """
+    Mulliken-style population of each atom on one orbital.
+
+    Returns (atom_contribs, pairs) where pairs is [(atom, qas), ...] for the
+    atoms whose contribution clears 1e-8.
+    """
+    atom_contribs = {}
+    pairs = []
+    for a in sorted(atom_ranges.keys()):
+        qas = 0.0
+        for u in atom_ranges[a]:
+            qas += c[u, col] * sc[u, col]
+        if abs(qas) <= 1.0e-8:
+            continue
+        angmom_contribs = _atom_angmom_contribs(
+            c, sc, col, atom_angmom_ranges.get(a, {}))
+        angmom_contribs['total'] = qas
+        atom_contribs[a] = angmom_contribs
+        pairs.append((a, qas))
+    return atom_contribs, pairs
+
+
+def _electron_distribution(pairs):
+    """
+    Turn [(atom, qas), ...] into [(atom, electrons, percent), ...] ordered by
+    atom number, along with the electron total.
+
+    Negative populations are clipped to zero here -- only when forming the
+    percentage distribution, as the original algorithm did.
+    """
+    non_negative = sorted(((a, max(0, qas)) for a, qas in pairs),
+                          key=lambda t: t[0])
+    total = sum(t[1] for t in non_negative)
+    return [(a, count, (count / total) * 100 if total > 0 else 0)
+            for a, count in non_negative], total
+
+
+def _orbital_contributions(electron_dist, atom_contribs, atom_symbols):
+    """Build the per-atom contribution records and the one-line summary parts."""
+    contribs = []
+    summary_parts = []
+    for a, _count, perc in electron_dist:
+        if perc <= 0.01:
+            continue
+        sym = atom_symbols.get(a, f"A{a}")
+        angmom_dict = atom_contribs[a].copy()
+        angmom_dict.pop('total', None)
+        hybrid = _format_hybrid_summary(angmom_dict)
+        contribs.append({
+            "atom": a,
+            "symbol": sym,
+            "percent": perc,
+            "hybrid": hybrid,
+            "angmoms": angmom_dict,
+        })
+        summary_parts.append(f"{sym}{a} {perc:.1f}% {hybrid}".strip())
+    return contribs, summary_parts
+
+
 def _population_analysis_data(c, s, basis, atom_info, fock=None, orb_occ=None, energies=None):
     # Adapted from the provided population_analy algorithm.  Atom percentages
     # come from signed Mulliken-style qas values; negative atom populations are
@@ -456,118 +589,29 @@ def _population_analysis_data(c, s, basis, atom_info, fock=None, orb_occ=None, e
     atom_ranges = _build_basis_atom_ranges(basis)
     atom_symbols = _atom_symbol_map(atom_info)
     nloc = c.shape[1]
-    iloc = np.array([i for i in range(nloc + 1)], dtype=int)
 
-    if fock is not None:
-        orb_energ = np.diag(c.T @ fock @ c)
-    elif energies is not None:
-        orb_energ = np.asarray(energies, dtype=float)
-    else:
-        orb_energ = np.full(nloc, np.nan)
-
-    if orb_occ is None:
-        occ = np.full(nloc, np.nan)
-    else:
-        occ = np.asarray(orb_occ)
-        if occ.ndim == 2:
-            occ = np.diag(occ)
-        occ = occ.astype(float)
-
+    orb_energ = _population_orbital_energies(c, fock, energies, nloc)
+    occ = _population_occupations(orb_occ, nloc)
     sc = s @ c
 
     orbitals = []
     atom_total_contrib = defaultdict(float)
 
-  
-    
+    for s_idx in range(1, nloc + 1):
+        col = s_idx - 1
+        atom_contribs, pairs = _atom_population_contribs(
+            c, sc, col, atom_ranges, atom_angmom_ranges)
+        electron_dist, total = _electron_distribution(pairs)
 
-    for ss in range(1, nloc + 1):
-        s_idx = iloc[ss]
-        nlist = 0
-        list_array = [0] * 100000
-        pop_array = [0.0] * 100000
+        eval_energy = orb_energ[col] if col < len(orb_energ) else np.nan
+        eval_occ = occ[col] if col < len(occ) else np.nan
 
-        atom_contribs = {}
+        contribs, summary_parts = _orbital_contributions(
+            electron_dist, atom_contribs, atom_symbols)
 
-        for a in sorted(atom_ranges.keys()):
-            qas = 0.0
-            for u in atom_ranges[a]:
-                qas += c[u, s_idx - 1] * sc[u, s_idx - 1]
-
-            if abs(qas) <= 1.0e-8:
-                continue
-
-            angmom_contribs = {}
-            angmom_abs_total = 0.0
-            for angmom, indices in atom_angmom_ranges.get(a, {}).items():
-                qas_ang = 0.0
-                for u in indices:
-                    qas_ang += c[u, s_idx - 1] * sc[u, s_idx - 1]
-                angmom_contribs[angmom] = abs(qas_ang)
-                angmom_abs_total += abs(qas_ang)
-            if angmom_abs_total > 1.0e-8:
-                for angmom in angmom_contribs:
-                    angmom_contribs[angmom] = (
-                        100.0 * angmom_contribs[angmom] / angmom_abs_total
-                    )
-            angmom_contribs['total'] = qas
-            atom_contribs[a] = angmom_contribs
-            nlist += 1
-            list_array[nlist] = a
-            pop_array[nlist] = qas
-
-        # Sort by absolute value descending
-        for u in range(1, nlist + 1):
-            for t in range(1, u + 1):
-                if abs(pop_array[t]) < abs(pop_array[u]):
-                    tmp = pop_array[u]
-                    pop_array[u] = pop_array[t]
-                    pop_array[t] = tmp
-                    tt = list_array[u]
-                    list_array[u] = list_array[t]
-                    list_array[t] = tt
-
-        eval_energy = orb_energ[s_idx - 1] if s_idx - 1 < len(orb_energ) else np.nan
-        eval_occ = occ[s_idx - 1] if s_idx - 1 < len(occ) else np.nan
-
-        # Create electron distribution
-        electron_dist = [(list_array[a], pop_array[a]) for a in range(1, nlist + 1)]
-        electron_dist.sort(key=lambda x: x[0])  # Sort by atom number
-
-        # Set negative values to zero (though pop_array is abs, but to be safe)
-        electron_dist_non_negative = [
-            (t[0], max(0, t[1]))
-            for t in electron_dist
-        ]
-
-        # Calculate the sum
-        total = sum(t[1] for t in electron_dist_non_negative)
-
-        # Create new list with percentages
-        new_electron_dist = [
-            (*t, (t[1] / total) * 100 if total > 0 else 0)
-            for t in electron_dist_non_negative
-        ]
-
-        contribs = []
-        summary_parts = []
-        for a, count, perc in new_electron_dist:
-            if perc > 0.01:
-                sym = atom_symbols.get(a, f"A{a}")
-                angmom_dict = atom_contribs[a].copy()
-                angmom_dict.pop('total', None)
-                hybrid = _format_hybrid_summary(angmom_dict)
-                contribs.append({
-                    "atom": a,
-                    "symbol": sym,
-                    "percent": perc,
-                    "hybrid": hybrid,
-                    "angmoms": angmom_dict,
-                })
-                summary_parts.append(f"{sym}{a} {perc:.1f}% {hybrid}".strip())
-
-        dom_atom = max(contribs, key=lambda x: x['percent'])['atom'] if contribs else None
-        dom_total = max(contribs, key=lambda x: x['percent'])['percent'] if contribs else 0.0
+        dominant = max(contribs, key=lambda x: x['percent']) if contribs else None
+        dom_atom = dominant['atom'] if dominant else None
+        dom_total = dominant['percent'] if dominant else 0.0
         dom_sym = atom_symbols.get(dom_atom, f"A{dom_atom}") if dom_atom else ""
 
         orbitals.append({
@@ -581,18 +625,16 @@ def _population_analysis_data(c, s, basis, atom_info, fock=None, orb_occ=None, e
             "summary": " | ".join(summary_parts),
         })
 
-        # Accumulate atom totals
         if np.isfinite(eval_occ) and total > 0:
-            for a, _, perc in new_electron_dist:
+            for a, _, perc in electron_dist:
                 atom_total_contrib[a] += (perc / 100.0) * eval_occ
 
-    totals = []
-    for atom in sorted(atom_symbols):
-        totals.append({
-            "atom": atom,
-            "symbol": atom_symbols.get(atom, f"A{atom}"),
-            "weighted_electrons": atom_total_contrib.get(atom, 0.0),
-        })
+    totals = [{
+        "atom": atom,
+        "symbol": atom_symbols.get(atom, f"A{atom}"),
+        "weighted_electrons": atom_total_contrib.get(atom, 0.0),
+    } for atom in sorted(atom_symbols)]
+
     return {
         "orbitals": orbitals,
         "atom_totals": totals,
@@ -645,41 +687,80 @@ def _build_source_details(source_type, source_path, spin,
     }
 
 
+def _nbo_overlap_candidate_paths(details):
+    """
+    .47 files that might carry the AO overlap for this source, most specific
+    first and de-duplicated.
+    """
+    candidates = []
+    basis_source_path = details.get("basis_source_path")
+    key_path = details.get("source_path")
+    if basis_source_path:
+        candidates.append(basis_source_path)
+    if key_path:
+        candidates.append(os.path.splitext(key_path)[0] + ".47")
+
+    resolved = []
+    seen = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        candidate = os.path.abspath(candidate)
+        if candidate in seen or not os.path.exists(candidate):
+            continue
+        seen.add(candidate)
+        if candidate.lower().endswith(".47"):
+            resolved.append(candidate)
+    return resolved
+
+
+def _overlap_from_nbo_47(candidate, basis_size):
+    """
+    AO overlap from one .47 file: its own $OVERLAP block when usable, else the
+    analytically-integrated overlap.
+
+    The fallback is cached per file, so it does not redo the integration on
+    every population-analysis request (nbo_read.get_ao_overlap_matrix is the
+    same cache localization uses for this file).
+    """
+    import nbo_read as _nr
+    _, matrices = _nr.process_47_file(candidate, basis_size)
+    overlap = matrices.get("OVERLAP")
+    if overlap is not None:
+        overlap = np.asarray(overlap, dtype=float)
+        if overlap.shape == (basis_size, basis_size):
+            return overlap
+
+    overlap = _nr.get_ao_overlap_matrix(candidate)
+    if overlap.shape == (basis_size, basis_size):
+        return overlap
+    return None
+
+
+def _overlap_from_source_file(source_type, source_path, basis_size):
+    """AO overlap computed by the reader that owns this source format."""
+    if source_type == "fchk":
+        import fchk_read as _fr
+        overlap = _fr.get_ao_overlap_matrix(source_path)
+    elif source_type == "molden":
+        import read_molden as _mr
+        overlap = _mr.get_ao_overlap_matrix(source_path)
+    else:
+        return None
+    if overlap is None:
+        return None
+    overlap = np.asarray(overlap, dtype=float)
+    return overlap if overlap.shape == (basis_size, basis_size) else None
+
+
 def _load_overlap_for_details(details, basis_size):
     source_type = str(details.get("source_type", "")).lower()
+
     if source_type == "nbo":
         try:
-            import nbo_read as _nr
-            key_path = details.get("source_path")
-            basis_source_path = details.get("basis_source_path")
-            candidates = []
-            if basis_source_path:
-                candidates.append(basis_source_path)
-            if key_path:
-                candidates.append(os.path.splitext(key_path)[0] + ".47")
-            seen = set()
-            for candidate in candidates:
-                if not candidate:
-                    continue
-                candidate = os.path.abspath(candidate)
-                if candidate in seen or not os.path.exists(candidate):
-                    continue
-                seen.add(candidate)
-                if not candidate.lower().endswith(".47"):
-                    continue
-                _, matrices = _nr.process_47_file(candidate, basis_size)
-                overlap = matrices.get("OVERLAP")
+            for candidate in _nbo_overlap_candidate_paths(details):
+                overlap = _overlap_from_nbo_47(candidate, basis_size)
                 if overlap is not None:
-                    overlap = np.asarray(overlap, dtype=float)
-                    if overlap.shape == (basis_size, basis_size):
-                        return overlap
-                # $OVERLAP section missing/wrong-shaped in this .47 -- fall
-                # back to the analytically-integrated overlap, cached per
-                # file so this doesn't redo the integration on every
-                # population-analysis request (nbo_read.get_ao_overlap_matrix
-                # is the same cache localization uses for this file).
-                overlap = _nr.get_ao_overlap_matrix(candidate)
-                if overlap.shape == (basis_size, basis_size):
                     return overlap
         except Exception:
             pass
@@ -687,18 +768,10 @@ def _load_overlap_for_details(details, basis_size):
     source_path = details.get("source_path")
     if source_path and os.path.exists(source_path):
         try:
-            if source_type == "fchk":
-                import fchk_read as _fr
-                overlap = _fr.get_ao_overlap_matrix(source_path)
-            elif source_type == "molden":
-                import read_molden as _mr
-                overlap = _mr.get_ao_overlap_matrix(source_path)
-            else:
-                overlap = None
+            overlap = _overlap_from_source_file(
+                source_type, source_path, basis_size)
             if overlap is not None:
-                overlap = np.asarray(overlap, dtype=float)
-                if overlap.shape == (basis_size, basis_size):
-                    return overlap
+                return overlap
         except Exception:
             pass
 
@@ -707,13 +780,107 @@ def _load_overlap_for_details(details, basis_size):
     return _compute_basis_overlap(basis)
 
 
+def _load_all_cmos(source_type, source_path, orbital_indices, spin):
+    """Every AO coefficient vector for this source, occupied and virtual alike."""
+    if source_type == "nbo":
+        import nbo_read as _nr
+        return _nr.load_cmos_headless(source_path, orbital_indices, spin)
+    if source_type == "fchk":
+        import fchk_read as _fr
+        return _fr.load_cmos_from_fchk(source_path, orbital_indices, spin)
+    if source_type == "molden":
+        import read_molden as _mr
+        return _mr.load_cmos_from_molden(source_path, orbital_indices, spin)
+    return None
+
+
+def _alpha_energies_occupations(source_type, source_path, basis_source_path):
+    """Alpha-spin energies and occupations, or (None, None) for an unknown source."""
+    if source_type == "nbo":
+        import nbo_read as _nr
+        ene, occ, _, _ = _nr.get_orbital_energies_and_occupations(
+            source_path, basis_source_path)
+    elif source_type == "fchk":
+        import fchk_read as _fr
+        ene, occ, _, _ = _fr.get_orbital_energies_and_occupations_fchk(source_path)
+    elif source_type == "molden":
+        import read_molden as _mr
+        ene, occ, _, _ = _mr.get_orbital_energies_and_occupations_molden(source_path)
+    else:
+        return None, None
+    return ene, occ
+
+
+def _energies_and_occupations_for_details(details, source_type, source_path, nbas):
+    """
+    Energies and occupations for all nbas orbitals: read from the source where
+    possible, then overridden by anything the details dict already carries.
+    Missing values stay NaN.
+    """
+    energies = np.full(nbas, np.nan)
+    occupations = np.full(nbas, np.nan)
+    try:
+        ene, occ = _alpha_energies_occupations(
+            source_type, source_path, details.get("basis_source_path"))
+        if ene is not None:
+            energies = np.asarray(ene, dtype=float).copy()
+        if occ is not None:
+            occupations = np.asarray(occ, dtype=float).copy()
+    except Exception:
+        pass
+
+    orb_dict = {orb.get("index"): orb for orb in (details.get("orbitals") or [])}
+    for idx in range(1, nbas + 1):
+        orb = orb_dict.get(idx)
+        if orb is None:
+            continue
+        if orb.get("energy") is not None:
+            energies[idx - 1] = orb.get("energy")
+        if orb.get("occupation") is not None:
+            occupations[idx - 1] = orb.get("occupation")
+    return energies, occupations
+
+
+def _resolve_transform_key_path(basis):
+    """The NBO key file to transform into, or None to stay in the AO basis."""
+    if isinstance(basis, dict):
+        return basis.get("key_path")
+    if isinstance(basis, str) and basis.startswith("key:"):
+        return basis[4:]
+    return None
+
+
+def _transform_to_key_basis(cmat, overlap, transform_key_path, spin, nbas):
+    """
+    Re-express coefficients and overlap in an NBO key-file basis.
+
+    Returns the inputs unchanged (and reports why) if the transformation
+    matrix cannot be loaded or does not match the AO basis size, so the
+    caller falls back to AO.
+    """
+    try:
+        import nbo_read as _nr
+        transmat = np.asarray(
+            _nr.load_transformation_matrix(transform_key_path, spin),
+            dtype=float).T
+        if transmat.shape != (nbas, nbas):
+            raise ValueError(
+                f"Transformation matrix shape {transmat.shape} "
+                f"does not match AO basis size {(nbas, nbas)}"
+            )
+        return np.linalg.inv(transmat) @ cmat, transmat.T @ overlap @ transmat
+    except Exception as e:
+        print(f"Failed to transform to selected NBO basis: {e}")
+        # Fall back to AO
+        return cmat, overlap
+
+
 def _compute_population_analysis_from_details(details, basis="AO"):
     if not details:
         return None
 
     basis_functions = _deserialise_basis_functions(details.get("basis_functions"))
     atom_info = _deserialise_atom_info(details.get("atom_info"))
-    provided_orbitals = details.get("orbitals") or []
     if not basis_functions or not atom_info:
         return None
 
@@ -723,85 +890,29 @@ def _compute_population_analysis_from_details(details, basis="AO"):
     source_type = str(details.get("source_type", "")).lower()
     source_path = details.get("source_path")
     spin = details.get("spin", "alpha")
-    
+
     try:
-        if source_type == "nbo":
-            import nbo_read as _nr
-            cmos = _nr.load_cmos_headless(source_path, orbital_indices, spin)
-        elif source_type == "fchk":
-            import fchk_read as _fr
-            cmos = _fr.load_cmos_from_fchk(source_path, orbital_indices, spin)
-        elif source_type == "molden":
-            import read_molden as _mr
-            cmos = _mr.load_cmos_from_molden(source_path, orbital_indices, spin)
-        else:
-            return None
+        cmos = _load_all_cmos(source_type, source_path, orbital_indices, spin)
     except Exception as e:
         print(f"Failed to load CMOs: {e}")
         return None
+    if cmos is None:
+        return None
 
-    # Compute energies and occupations for all orbitals
-    energies = np.full(nbas, np.nan)
-    occupations = np.full(nbas, np.nan)
-    try:
-        if source_type == "nbo":
-            import nbo_read as _nr
-            ene, occ, _, _ = _nr.get_orbital_energies_and_occupations(source_path, details.get("basis_source_path"))
-        elif source_type == "fchk":
-            import fchk_read as _fr
-            ene, occ, _, _ = _fr.get_orbital_energies_and_occupations_fchk(source_path)
-        elif source_type == "molden":
-            import read_molden as _mr
-            ene, occ, _, _ = _mr.get_orbital_energies_and_occupations_molden(source_path)
-        else:
-            ene = occ = None
-        
-        if ene is not None:
-            energies = np.asarray(ene, dtype=float).copy()
-        if occ is not None:
-            occupations = np.asarray(occ, dtype=float).copy()
-    except Exception:
-        pass
-
-    # Override with provided if available
-    orb_dict = {orb.get("index"): orb for orb in provided_orbitals}
-    for idx in orbital_indices:
-        if idx in orb_dict:
-            orb = orb_dict[idx]
-            if orb.get("energy") is not None:
-                energies[idx - 1] = orb.get("energy")
-            if orb.get("occupation") is not None:
-                occupations[idx - 1] = orb.get("occupation")
+    energies, occupations = _energies_and_occupations_for_details(
+        details, source_type, source_path, nbas)
 
     overlap = _load_overlap_for_details(details, nbas)
     cmat = np.column_stack(cmos)
 
-
     # Transform to selected NBO-key basis if requested.  AO remains the default
     # because S and the initially loaded coefficients are in the AO basis.
-    transform_key_path = None
-    if isinstance(basis, dict):
-        transform_key_path = basis.get("key_path")
-    elif isinstance(basis, str) and basis.startswith("key:"):
-        transform_key_path = basis[4:]
+    transform_key_path = _resolve_transform_key_path(basis)
+    if transform_key_path and source_type == "nbo":
+        cmat, overlap = _transform_to_key_basis(
+            cmat, overlap, transform_key_path,
+            details.get("spin") or "alpha", nbas)
 
-    if transform_key_path and str(details.get("source_type", "")).lower() == "nbo":
-        try:
-            transmat = _nr.load_transformation_matrix(
-                transform_key_path,
-                details.get("spin") or "alpha",
-            )
-            transmat = np.asarray(transmat, dtype=float).T
-            if transmat.shape != (nbas, nbas):
-                raise ValueError(
-                    f"Transformation matrix shape {transmat.shape} "
-                    f"does not match AO basis size {(nbas, nbas)}"
-                )
-            cmat = np.linalg.inv(transmat) @ cmat
-            overlap = transmat.T @ overlap @ transmat
-        except Exception as e:
-            print(f"Failed to transform to selected NBO basis: {e}")
-            # Fall back to AO
     return _population_analysis_data(
         cmat,
         overlap,
@@ -1462,14 +1573,7 @@ class _OrbitalPickerDialog(QDialog):
         gg = QGridLayout(grid_group)
 
         gg.addWidget(QLabel("Quality:"), 0, 0)
-        self.quality_combo = QComboBox()
-        self.quality_combo.addItems([
-            "Low     (50 pts)",
-            "Medium  (75 pts)",
-            "Fine    (100 pts)",
-            "Ultra   (125 pts)"
-        ])
-        self.quality_combo.setCurrentIndex(2)
+        self.quality_combo = make_grid_quality_combo()
         gg.addWidget(self.quality_combo, 0, 1)
 
         gg.addWidget(QLabel("Extension (bohr):"), 1, 0)
@@ -1520,8 +1624,7 @@ class _OrbitalPickerDialog(QDialog):
             return
         space, orbital_range = dlg.selection()
 
-        quality_map = {0: 50, 1: 75, 2: 100, 3: 125}
-        grid_quality = quality_map[self.quality_combo.currentIndex()]
+        grid_quality = grid_quality_of(self.quality_combo)
         ext_dist = self.ext_slider.value() / 10.0
         spin = "beta" if (self.spin_combo and self.spin_combo.currentIndex() == 1) else "alpha"
 
@@ -1548,8 +1651,7 @@ class _OrbitalPickerDialog(QDialog):
             return
         density_types = dlg.selection()
 
-        quality_map = {0: 50, 1: 75, 2: 100, 3: 125}
-        grid_quality = quality_map[self.quality_combo.currentIndex()]
+        grid_quality = grid_quality_of(self.quality_combo)
         ext_dist = self.ext_slider.value() / 10.0
 
         self.compute_btn.setEnabled(False)
@@ -1734,8 +1836,7 @@ class _OrbitalPickerDialog(QDialog):
             QMessageBox.warning(self, "No Selection", "Please select at least one orbital.")
             return
 
-        quality_map = {0: 50, 1: 75, 2: 100, 3: 125}
-        grid_quality = quality_map[self.quality_combo.currentIndex()]
+        grid_quality = grid_quality_of(self.quality_combo)
         ext_dist = self.ext_slider.value() / 10.0
         
         spin = "beta" if (self.spin_combo and self.spin_combo.currentIndex() == 1) else "alpha"
@@ -2130,11 +2231,7 @@ class _FchkOrbitalPickerDialog(QDialog):
         grid_group = QGroupBox("Grid Settings")
         gg = QGridLayout(grid_group)
         gg.addWidget(QLabel("Quality:"), 0, 0)
-        self.quality_combo = QComboBox()
-        self.quality_combo.addItems([
-            "Low     (50 pts)", "Medium  (75 pts)",
-            "Fine    (100 pts)", "Ultra   (125 pts)"])
-        self.quality_combo.setCurrentIndex(2)
+        self.quality_combo = make_grid_quality_combo()
         gg.addWidget(self.quality_combo, 0, 1)
         gg.addWidget(QLabel("Extension (bohr):"), 1, 0)
         ext_row = QHBoxLayout()
@@ -2178,8 +2275,7 @@ class _FchkOrbitalPickerDialog(QDialog):
             return
         space, orbital_range = dlg.selection()
 
-        quality_map = {0: 50, 1: 75, 2: 100, 3: 125}
-        grid_quality = quality_map[self.quality_combo.currentIndex()]
+        grid_quality = grid_quality_of(self.quality_combo)
         ext_dist = self.ext_slider.value() / 10.0
         spin = "beta" if (self.spin_combo and self.spin_combo.currentIndex() == 1) else "alpha"
 
@@ -2201,8 +2297,7 @@ class _FchkOrbitalPickerDialog(QDialog):
             return
         density_types = dlg.selection()
 
-        quality_map = {0: 50, 1: 75, 2: 100, 3: 125}
-        grid_quality = quality_map[self.quality_combo.currentIndex()]
+        grid_quality = grid_quality_of(self.quality_combo)
         ext_dist = self.ext_slider.value() / 10.0
 
         self.compute_btn.setEnabled(False)
@@ -2339,8 +2434,7 @@ class _FchkOrbitalPickerDialog(QDialog):
             QMessageBox.warning(self, "No Selection",
                                 "Please select at least one orbital.")
             return
-        quality_map  = {0: 50, 1: 75, 2: 100, 3: 125}
-        grid_quality = quality_map[self.quality_combo.currentIndex()]
+        grid_quality = grid_quality_of(self.quality_combo)
         ext_dist     = self.ext_slider.value() / 10.0
         spin = "beta" if (self.spin_combo and
                           self.spin_combo.currentIndex() == 1) else "alpha"
@@ -2603,11 +2697,7 @@ class _MoldenOrbitalPickerDialog(QDialog):
         grid_group = QGroupBox("Grid Settings")
         gg = QGridLayout(grid_group)
         gg.addWidget(QLabel("Quality:"), 0, 0)
-        self.quality_combo = QComboBox()
-        self.quality_combo.addItems([
-            "Low     (50 pts)", "Medium  (75 pts)",
-            "Fine    (100 pts)", "Ultra   (125 pts)"])
-        self.quality_combo.setCurrentIndex(2)
+        self.quality_combo = make_grid_quality_combo()
         gg.addWidget(self.quality_combo, 0, 1)
         gg.addWidget(QLabel("Extension (bohr):"), 1, 0)
         ext_row = QHBoxLayout()
@@ -2651,8 +2741,7 @@ class _MoldenOrbitalPickerDialog(QDialog):
             return
         space, orbital_range = dlg.selection()
 
-        quality_map = {0: 50, 1: 75, 2: 100, 3: 125}
-        grid_quality = quality_map[self.quality_combo.currentIndex()]
+        grid_quality = grid_quality_of(self.quality_combo)
         ext_dist = self.ext_slider.value() / 10.0
         spin = "beta" if (self.spin_combo and self.spin_combo.currentIndex() == 1) else "alpha"
 
@@ -2674,8 +2763,7 @@ class _MoldenOrbitalPickerDialog(QDialog):
             return
         density_types = dlg.selection()
 
-        quality_map = {0: 50, 1: 75, 2: 100, 3: 125}
-        grid_quality = quality_map[self.quality_combo.currentIndex()]
+        grid_quality = grid_quality_of(self.quality_combo)
         ext_dist = self.ext_slider.value() / 10.0
 
         self.compute_btn.setEnabled(False)
@@ -2714,8 +2802,7 @@ class _MoldenOrbitalPickerDialog(QDialog):
             QMessageBox.warning(self, "No Selection",
                                 "Please select at least one orbital.")
             return
-        quality_map  = {0: 50, 1: 75, 2: 100, 3: 125}
-        grid_quality = quality_map[self.quality_combo.currentIndex()]
+        grid_quality = grid_quality_of(self.quality_combo)
         ext_dist     = self.ext_slider.value() / 10.0
         spin = "beta" if (self.spin_combo and
                           self.spin_combo.currentIndex() == 1) else "alpha"
@@ -2756,6 +2843,40 @@ _CONTOUR_COLOR_PAIRS = [
 ]
 
 _BOHR_TO_ANG = 0.529177   # bohr → Å
+
+
+def _prompt_figure_save_path(parent, title, default_name):
+    """
+    Ask for a PNG/PDF destination for a matplotlib figure.
+
+    Returns the chosen path with its extension normalised to the detected
+    format, or None when the dialog was cancelled.
+    """
+    dialog = QFileDialog(parent, title)
+    dialog.setOption(QFileDialog.DontUseNativeDialog)
+    dialog.setDirectory(_default_dir())
+    dialog.setAcceptMode(QFileDialog.AcceptSave)
+    dialog.setFileMode(QFileDialog.AnyFile)
+    dialog.setNameFilter("PNG Image (*.png);;PDF Document (*.pdf)")
+    dialog.selectFile(default_name)
+    if not dialog.exec_():
+        return None
+    path = dialog.selectedFiles()[0]
+    _remember_dir(path)
+    fmt = "pdf" if path.lower().endswith(".pdf") else "png"
+    if not path.lower().endswith(f".{fmt}"):
+        path += f".{fmt}"
+    return path
+
+
+def _save_figure_to_path(parent, fig, path, facecolor):
+    """Write *fig* at the project's standard export settings, reporting either way."""
+    try:
+        fig.savefig(path, dpi=150, bbox_inches="tight", pad_inches=0.1,
+                    facecolor=facecolor, edgecolor="none")
+        QMessageBox.information(parent, "Saved", f"Saved to:\n{path}")
+    except Exception as e:
+        QMessageBox.critical(parent, "Save Error", str(e))
 
 
 class ContourViewerDialog(QDialog):
@@ -3150,84 +3271,71 @@ class ContourViewerDialog(QDialog):
 
     # ── save ─────────────────────────────────────────────────────────────
 
+    def _apply_print_style(self):
+        """Recolour the axes for a white print background."""
+        self._fig.patch.set_facecolor("white")
+        self._ax.set_facecolor("white")
+        for spine in self._ax.spines.values():
+            spine.set_visible(True)
+            spine.set_edgecolor("#333333")
+        self._ax.tick_params(colors="black", labelsize=8)
+        self._ax.xaxis.label.set_color("black")
+        self._ax.yaxis.label.set_color("black")
+        self._ax.title.set_color("black")
+        for lbl in (self._ax.get_xticklabels() + self._ax.get_yticklabels()):
+            lbl.set_color("black")
+        leg = self._ax.get_legend()
+        if leg:
+            for txt in leg.get_texts():
+                txt.set_color("black")
+            leg.get_frame().set_facecolor("white")
+            leg.get_frame().set_edgecolor("#aaaaaa")
+
+    def _restore_dark_style(self, fig_fc, ax_fc, spine_colors):
+        """Undo _apply_print_style, restoring the on-screen dark theme."""
+        self._fig.patch.set_facecolor(fig_fc)
+        self._ax.set_facecolor(ax_fc)
+        for key, col in spine_colors.items():
+            self._ax.spines[key].set_edgecolor(col)
+            self._ax.spines[key].set_visible(False)
+        self._ax.tick_params(colors="#a6adc8", labelsize=8)
+        self._ax.xaxis.label.set_color("#cdd6f4")
+        self._ax.yaxis.label.set_color("#cdd6f4")
+        self._ax.title.set_color("#cdd6f4")
+        for lbl in (self._ax.get_xticklabels() + self._ax.get_yticklabels()):
+            lbl.set_color("#a6adc8")
+        leg = self._ax.get_legend()
+        if leg:
+            for txt in leg.get_texts():
+                txt.set_color("#cdd6f4")
+            leg.get_frame().set_facecolor("#181825")
+            leg.get_frame().set_edgecolor("#45475a")
+
     def _save_figure(self, white_bg=False):
-        _qd = QFileDialog(self, "Save Contour Plot")
-        _qd.setOption(QFileDialog.DontUseNativeDialog)
-        _qd.setDirectory(_default_dir())
-        _qd.setAcceptMode(QFileDialog.AcceptSave)
-        _qd.setFileMode(QFileDialog.AnyFile)
-        _qd.setNameFilter("PNG Image (*.png);;PDF Document (*.pdf)")
-        _qd.selectFile("contour_white.png" if white_bg else "contour_dark.png")
-        if not _qd.exec_():
+        path = _prompt_figure_save_path(
+            self, "Save Contour Plot",
+            "contour_white.png" if white_bg else "contour_dark.png")
+        if path is None:
             return
-        path = _qd.selectedFiles()[0]
-        _remember_dir(path)
-        fmt = "pdf" if path.lower().endswith(".pdf") else "png"
-        if not path.lower().endswith(f".{fmt}"):
-            path += f".{fmt}"
 
         self._canvas.draw()
 
         if not white_bg:
-            try:
-                self._fig.savefig(path, dpi=150, bbox_inches="tight",
-                                  pad_inches=0.1,
-                                  facecolor=self._fig.get_facecolor(),
-                                  edgecolor="none")
-                QMessageBox.information(self, "Saved", f"Saved to:\n{path}")
-            except Exception as e:
-                QMessageBox.critical(self, "Save Error", str(e))
-        else:
-            # Snapshot dark colours, apply white, save, restore
-            fig_fc  = self._fig.get_facecolor()
-            ax_fc   = self._ax.get_facecolor()
-            ax_sp   = {k: s.get_edgecolor() for k, s in self._ax.spines.items()}
-            try:
-                self._fig.patch.set_facecolor("white")
-                self._ax.set_facecolor("white")
-                for s in self._ax.spines.values():
-                    s.set_visible(True); s.set_edgecolor("#333333")
-                self._ax.tick_params(colors="black", labelsize=8)
-                self._ax.xaxis.label.set_color("black")
-                self._ax.yaxis.label.set_color("black")
-                self._ax.title.set_color("black")
-                for lbl in (self._ax.get_xticklabels() +
-                             self._ax.get_yticklabels()):
-                    lbl.set_color("black")
-                # Also fix legend text if present
-                leg = self._ax.get_legend()
-                if leg:
-                    for txt in leg.get_texts():
-                        txt.set_color("black")
-                    leg.get_frame().set_facecolor("white")
-                    leg.get_frame().set_edgecolor("#aaaaaa")
-                self._canvas.draw()
-                self._fig.savefig(path, dpi=150, bbox_inches="tight",
-                                  pad_inches=0.1,
-                                  facecolor="white", edgecolor="none")
-                QMessageBox.information(self, "Saved", f"Saved to:\n{path}")
-            except Exception as e:
-                QMessageBox.critical(self, "Save Error", str(e))
-            finally:
-                self._fig.patch.set_facecolor(fig_fc)
-                self._ax.set_facecolor(ax_fc)
-                for k, col in ax_sp.items():
-                    self._ax.spines[k].set_edgecolor(col)
-                    self._ax.spines[k].set_visible(False)
-                self._ax.tick_params(colors="#a6adc8", labelsize=8)
-                self._ax.xaxis.label.set_color("#cdd6f4")
-                self._ax.yaxis.label.set_color("#cdd6f4")
-                self._ax.title.set_color("#cdd6f4")
-                for lbl in (self._ax.get_xticklabels() +
-                             self._ax.get_yticklabels()):
-                    lbl.set_color("#a6adc8")
-                leg = self._ax.get_legend()
-                if leg:
-                    for txt in leg.get_texts():
-                        txt.set_color("#cdd6f4")
-                    leg.get_frame().set_facecolor("#181825")
-                    leg.get_frame().set_edgecolor("#45475a")
-                self._canvas.draw_idle()
+            _save_figure_to_path(self, self._fig, path,
+                                 self._fig.get_facecolor())
+            return
+
+        # Snapshot dark colours, apply white, save, restore
+        fig_fc = self._fig.get_facecolor()
+        ax_fc = self._ax.get_facecolor()
+        ax_sp = {k: s.get_edgecolor() for k, s in self._ax.spines.items()}
+        try:
+            self._apply_print_style()
+            self._canvas.draw()
+            _save_figure_to_path(self, self._fig, path, "white")
+        finally:
+            self._restore_dark_style(fig_fc, ax_fc, ax_sp)
+            self._canvas.draw_idle()
 
     def showEvent(self, event):
         self._populate_cube_list()
@@ -3571,70 +3679,61 @@ class RadialDensityDialog(QDialog):
 
     # ── save ─────────────────────────────────────────────────────────────
 
+    def _apply_print_style(self):
+        """Recolour the axes for a white print background."""
+        self._fig.patch.set_facecolor("white")
+        self._ax.set_facecolor("white")
+        for key, spine in self._ax.spines.items():
+            spine.set_visible(True)
+            spine.set_edgecolor(
+                "#333333" if key in ("bottom", "left") else "#cccccc")
+        self._ax.tick_params(colors="black", labelsize=10)
+        self._ax.xaxis.label.set_color("black")
+        self._ax.yaxis.label.set_color("black")
+        for lbl in (self._ax.get_xticklabels() + self._ax.get_yticklabels()):
+            lbl.set_color("black")
+
+    def _restore_dark_style(self, fig_fc, ax_fc, spine_state):
+        """
+        Undo _apply_print_style.  Each spine's original visibility is restored
+        as well as its colour, since this plot hides only some of them.
+        """
+        self._fig.patch.set_facecolor(fig_fc)
+        self._ax.set_facecolor(ax_fc)
+        for key, (col, vis) in spine_state.items():
+            self._ax.spines[key].set_edgecolor(col)
+            self._ax.spines[key].set_visible(vis)
+        self._ax.tick_params(colors="#a6adc8", labelsize=10)
+        self._ax.xaxis.label.set_color("#cdd6f4")
+        self._ax.yaxis.label.set_color("#cdd6f4")
+        for lbl in (self._ax.get_xticklabels() + self._ax.get_yticklabels()):
+            lbl.set_color("#a6adc8")
+
     def _save_figure(self, white_bg=False):
-        _qd = QFileDialog(self, "Save Radial Density Plot")
-        _qd.setOption(QFileDialog.DontUseNativeDialog)
-        _qd.setDirectory(_default_dir())
-        _qd.setAcceptMode(QFileDialog.AcceptSave)
-        _qd.setFileMode(QFileDialog.AnyFile)
-        _qd.setNameFilter("PNG Image (*.png);;PDF Document (*.pdf)")
-        _qd.selectFile("radial_white.png" if white_bg else "radial_dark.png")
-        if not _qd.exec_():
+        path = _prompt_figure_save_path(
+            self, "Save Radial Density Plot",
+            "radial_white.png" if white_bg else "radial_dark.png")
+        if path is None:
             return
-        path = _qd.selectedFiles()[0]
-        _remember_dir(path)
-        fmt = "pdf" if path.lower().endswith(".pdf") else "png"
-        if not path.lower().endswith(f".{fmt}"):
-            path += f".{fmt}"
+
         self._canvas.draw()
 
         if not white_bg:
-            try:
-                self._fig.savefig(path, dpi=150, bbox_inches="tight",
-                                  pad_inches=0.1,
-                                  facecolor=self._fig.get_facecolor(),
-                                  edgecolor="none")
-                QMessageBox.information(self, "Saved", f"Saved to:\n{path}")
-            except Exception as e:
-                QMessageBox.critical(self, "Save Error", str(e))
-        else:
-            fig_fc = self._fig.get_facecolor()
-            ax_fc  = self._ax.get_facecolor()
-            ax_sp  = {k: (s.get_edgecolor(), s.get_visible())
-                      for k, s in self._ax.spines.items()}
-            try:
-                self._fig.patch.set_facecolor("white")
-                self._ax.set_facecolor("white")
-                for k, s in self._ax.spines.items():
-                    s.set_visible(True)
-                    s.set_edgecolor(
-                        "#333333" if k in ("bottom", "left") else "#cccccc")
-                self._ax.tick_params(colors="black", labelsize=10)
-                self._ax.xaxis.label.set_color("black")
-                self._ax.yaxis.label.set_color("black")
-                for lbl in (self._ax.get_xticklabels() +
-                             self._ax.get_yticklabels()):
-                    lbl.set_color("black")
-                self._canvas.draw()
-                self._fig.savefig(path, dpi=150, bbox_inches="tight",
-                                  pad_inches=0.1,
-                                  facecolor="white", edgecolor="none")
-                QMessageBox.information(self, "Saved", f"Saved to:\n{path}")
-            except Exception as e:
-                QMessageBox.critical(self, "Save Error", str(e))
-            finally:
-                self._fig.patch.set_facecolor(fig_fc)
-                self._ax.set_facecolor(ax_fc)
-                for k, (col, vis) in ax_sp.items():
-                    self._ax.spines[k].set_edgecolor(col)
-                    self._ax.spines[k].set_visible(vis)
-                self._ax.tick_params(colors="#a6adc8", labelsize=10)
-                self._ax.xaxis.label.set_color("#cdd6f4")
-                self._ax.yaxis.label.set_color("#cdd6f4")
-                for lbl in (self._ax.get_xticklabels() +
-                             self._ax.get_yticklabels()):
-                    lbl.set_color("#a6adc8")
-                self._canvas.draw_idle()
+            _save_figure_to_path(self, self._fig, path,
+                                 self._fig.get_facecolor())
+            return
+
+        fig_fc = self._fig.get_facecolor()
+        ax_fc = self._ax.get_facecolor()
+        ax_sp = {k: (s.get_edgecolor(), s.get_visible())
+                 for k, s in self._ax.spines.items()}
+        try:
+            self._apply_print_style()
+            self._canvas.draw()
+            _save_figure_to_path(self, self._fig, path, "white")
+        finally:
+            self._restore_dark_style(fig_fc, ax_fc, ax_sp)
+            self._canvas.draw_idle()
 
     def showEvent(self, event):
         self._populate_cube_combo()
@@ -3776,119 +3875,81 @@ class SourceDetailsDialog(QDialog):
         ))
         return widget
 
-    def _build_coeff_table(self, basis_rows, orbitals):
-        FROZEN_COLS = [
-            ("N",      "N",       52),
-            ("Center", "CENTER",  68),
-            ("Orbital","orb_val", 82),
-        ]
-        FROZEN_WIDTH = sum(w for _, _, w in FROZEN_COLS)
+    _FROZEN_COLS = [
+        ("N",       "N",       52),
+        ("Center",  "CENTER",  68),
+        ("Orbital", "orb_val", 82),
+    ]
 
-        # Build row data
-        rows = []
-        for bf in basis_rows:
-            rows.append({
-                "N":       bf.get("N", ""),
-                "CENTER":  bf.get("CENTER", ""),
-                "orb_val": bf.get("orb_val", ""),
-            })
+    @staticmethod
+    def _orbital_column_title(orbital):
+        """Multi-line header for one orbital: label, then energy and occupation."""
+        label = orbital.get("label", orbital.get("index", "?"))
+        title = label if len(label) <= 18 else label[-18:]
+        energy = orbital.get("energy")
+        occupation = orbital.get("occupation")
+        if energy is not None:
+            title += f"\nE={energy:.4f}"
+        if occupation is not None:
+            title += f"\nocc={occupation:.3f}"
+        return title
+
+    def _coeff_row_data(self, basis_rows, orbitals):
+        """
+        Assemble the coefficient grid.
+
+        Returns (rows, scroll_columns) where each row holds the three frozen
+        fields plus one entry per orbital column, keyed by that column's key.
+        """
+        rows = [{
+            "N":       bf.get("N", ""),
+            "CENTER":  bf.get("CENTER", ""),
+            "orb_val": bf.get("orb_val", ""),
+        } for bf in basis_rows]
 
         scroll_columns = []
         for orbital in orbitals:
-            energy     = orbital.get("energy")
-            occupation = orbital.get("occupation")
-            label      = orbital.get("label", orbital.get("index", "?"))
-            short_label = label if len(label) <= 18 else label[-18:]
-            title = short_label
-            if energy is not None:
-                title += f"\nE={energy:.4f}"
-            if occupation is not None:
-                title += f"\nocc={occupation:.3f}"
-            key = f"orb_{orbital.get('index', len(FROZEN_COLS) + len(scroll_columns))}"
+            title = self._orbital_column_title(orbital)
+            key = (f"orb_{orbital.get('index', len(self._FROZEN_COLS) + len(scroll_columns))}")
             scroll_columns.append((title, key))
-            coeffs = orbital.get("coefficients", [])
-            for row, coeff in zip(rows, coeffs):
+            for row, coeff in zip(rows, orbital.get("coefficients", [])):
                 row[key] = coeff
+        return rows, scroll_columns
 
-        n_rows = len(rows)
+    @staticmethod
+    def _configure_coeff_table(table, labels, header_height, scrollbars):
+        """
+        Apply the settings both halves of the coefficient view share, and
+        return the horizontal header for per-column setup.
 
-        # ── Measure the scroll table's header height so frozen header matches ──
-        # The scroll columns have multi-line headers (label + E= + occ=).
-        # We count the max number of newlines to set a fixed height for both.
-        max_header_lines = max(
-            (title.count('\n') + 1 for title, _ in scroll_columns),
-            default=1
-        )
-        # Approximate: each line ~18px, plus 8px padding
-        HEADER_HEIGHT = max_header_lines * 18 + 8
+        *scrollbars* is used for both directions: the frozen half turns them
+        off and lets the scrollable half drive.
+        """
+        table.setAlternatingRowColors(True)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        table.verticalHeader().setVisible(False)
+        table.setHorizontalHeaderLabels(labels)
+        table.setWordWrap(False)
+        table.setHorizontalScrollBarPolicy(scrollbars)
+        table.setVerticalScrollBarPolicy(scrollbars)
+        header = table.horizontalHeader()
+        header.setFixedHeight(header_height)
+        return header
 
-        # ── Frozen table (N, Center, Orbital) ────────────────────────────────
-        frozen_table = _SyncedTableWidget(n_rows, len(FROZEN_COLS))
-        frozen_table.setAlternatingRowColors(True)
-        frozen_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        frozen_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        frozen_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        frozen_table.verticalHeader().setVisible(False)
-        frozen_table.setHorizontalHeaderLabels([lbl for lbl, _, _ in FROZEN_COLS])
-        frozen_table.setWordWrap(False)
-        # Disable both scrollbars — driven by the scroll table instead
-        frozen_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        frozen_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        frozen_table.setFocusPolicy(Qt.NoFocus)
-        frozen_table.set_freeze_horizontal(True)
-        fh = frozen_table.horizontalHeader()
-        fh.setFixedHeight(HEADER_HEIGHT)
-        for c, (_, _, w) in enumerate(FROZEN_COLS):
-            fh.setSectionResizeMode(c, QHeaderView.Fixed)
-            frozen_table.setColumnWidth(c, w)
-        frozen_table.setFixedWidth(FROZEN_WIDTH + 2)   # +2 for border
-
-        for r, row in enumerate(rows):
-            for c, (_, key, _) in enumerate(FROZEN_COLS):
-                item = QTableWidgetItem(str(row.get(key, "")))
-                frozen_table.setItem(r, c, item)
-
-        # ── Scrollable table (orbital coefficient columns) ────────────────────
-        scroll_table = _SyncedTableWidget(n_rows, len(scroll_columns))
-        scroll_table.setAlternatingRowColors(True)
-        scroll_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        scroll_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        scroll_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        scroll_table.verticalHeader().setVisible(False)
-        scroll_table.setHorizontalHeaderLabels([lbl for lbl, _ in scroll_columns])
-        scroll_table.setWordWrap(False)
-        scroll_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll_table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        sh = scroll_table.horizontalHeader()
-        sh.setFixedHeight(HEADER_HEIGHT)
-        for c, (_, key) in enumerate(scroll_columns):
-            sh.setSectionResizeMode(c, QHeaderView.Fixed)
-            scroll_table.setColumnWidth(c, 112)
-
-        mono_font = QFont("Consolas", 9)
-        for r, row in enumerate(rows):
-            for c, (_, key) in enumerate(scroll_columns):
-                val = row.get(key, "")
-                if val == "" or val is None:
-                    text = ""
-                else:
-                    text = f"{float(val): .6f}"
-                item = QTableWidgetItem(text)
-                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                item.setFont(mono_font)
-                scroll_table.setItem(r, c, item)
-
-        # ── Synchronise row heights and vertical scroll ───────────────────────
-        # Row heights are uniform by default; sync once and also on section resize
-        def _sync_row_heights():
-            for r in range(n_rows):
-                frozen_table.setRowHeight(r, scroll_table.rowHeight(r))
-
-        _sync_row_heights()
+    @staticmethod
+    def _link_coeff_tables(frozen_table, scroll_table, n_rows):
+        """
+        Keep the frozen and scrollable halves showing the same rows: matching
+        row heights, a shared vertical scroll position, and mirrored selection.
+        """
+        for r in range(n_rows):
+            frozen_table.setRowHeight(r, scroll_table.rowHeight(r))
         scroll_table.verticalHeader().sectionResized.connect(
             lambda idx, _old, new: frozen_table.setRowHeight(idx, new))
 
-        # Keep vertical scroll positions in sync (scroll_table is the master)
+        # scroll_table is the master for vertical position
         scroll_table.verticalScrollBar().valueChanged.connect(
             frozen_table.verticalScrollBar().setValue)
         frozen_table.verticalScrollBar().valueChanged.connect(
@@ -3896,40 +3957,85 @@ class SourceDetailsDialog(QDialog):
         frozen_table.set_sync_peer(scroll_table)
         scroll_table.set_sync_peer(frozen_table)
 
-        # Keep row selections in sync
-        _syncing_selection = [False]
+        # A re-entrancy guard: mirroring a selection triggers the peer's own
+        # itemSelectionChanged, which would otherwise bounce back.
+        syncing = [False]
 
-        def _scroll_sel_changed():
-            if _syncing_selection[0]:
+        def mirror(source, target):
+            if syncing[0]:
                 return
-            _syncing_selection[0] = True
-            idxs = {idx.row() for idx in scroll_table.selectedIndexes()}
-            frozen_table.clearSelection()
-            for r in idxs:
-                frozen_table.selectRow(r)
-            _syncing_selection[0] = False
+            syncing[0] = True
+            rows = {idx.row() for idx in source.selectedIndexes()}
+            target.clearSelection()
+            for r in rows:
+                target.selectRow(r)
+            syncing[0] = False
 
-        def _frozen_sel_changed():
-            if _syncing_selection[0]:
-                return
-            _syncing_selection[0] = True
-            idxs = {idx.row() for idx in frozen_table.selectedIndexes()}
-            scroll_table.clearSelection()
-            for r in idxs:
-                scroll_table.selectRow(r)
-            _syncing_selection[0] = False
+        scroll_table.itemSelectionChanged.connect(
+            lambda: mirror(scroll_table, frozen_table))
+        frozen_table.itemSelectionChanged.connect(
+            lambda: mirror(frozen_table, scroll_table))
 
-        scroll_table.itemSelectionChanged.connect(_scroll_sel_changed)
-        frozen_table.itemSelectionChanged.connect(_frozen_sel_changed)
+    def _build_frozen_half(self, rows, header_height):
+        """The fixed-width N / Center / Orbital columns."""
+        table = _SyncedTableWidget(len(rows), len(self._FROZEN_COLS))
+        header = self._configure_coeff_table(
+            table, [lbl for lbl, _, _ in self._FROZEN_COLS],
+            header_height, Qt.ScrollBarAlwaysOff)
+        table.setFocusPolicy(Qt.NoFocus)
+        table.set_freeze_horizontal(True)
+        for c, (_, _, w) in enumerate(self._FROZEN_COLS):
+            header.setSectionResizeMode(c, QHeaderView.Fixed)
+            table.setColumnWidth(c, w)
+        table.setFixedWidth(
+            sum(w for _, _, w in self._FROZEN_COLS) + 2)   # +2 for border
 
-        # ── Outer container ───────────────────────────────────────────────────
+        for r, row in enumerate(rows):
+            for c, (_, key, _) in enumerate(self._FROZEN_COLS):
+                table.setItem(r, c, QTableWidgetItem(str(row.get(key, ""))))
+        return table
+
+    def _build_scroll_half(self, rows, scroll_columns, header_height):
+        """The scrollable per-orbital coefficient columns."""
+        table = _SyncedTableWidget(len(rows), len(scroll_columns))
+        header = self._configure_coeff_table(
+            table, [lbl for lbl, _ in scroll_columns],
+            header_height, Qt.ScrollBarAsNeeded)
+        for c in range(len(scroll_columns)):
+            header.setSectionResizeMode(c, QHeaderView.Fixed)
+            table.setColumnWidth(c, 112)
+
+        mono_font = QFont("Consolas", 9)
+        for r, row in enumerate(rows):
+            for c, (_, key) in enumerate(scroll_columns):
+                val = row.get(key, "")
+                text = "" if val == "" or val is None else f"{float(val): .6f}"
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                item.setFont(mono_font)
+                table.setItem(r, c, item)
+        return table
+
+    def _build_coeff_table(self, basis_rows, orbitals):
+        rows, scroll_columns = self._coeff_row_data(basis_rows, orbitals)
+
+        # The scroll columns carry multi-line headers (label + E= + occ=), so
+        # both halves get a fixed height derived from the tallest one --
+        # roughly 18px per line plus 8px padding -- to keep them aligned.
+        max_header_lines = max(
+            (title.count('\n') + 1 for title, _ in scroll_columns), default=1)
+        header_height = max_header_lines * 18 + 8
+
+        frozen_table = self._build_frozen_half(rows, header_height)
+        scroll_table = self._build_scroll_half(rows, scroll_columns, header_height)
+        self._link_coeff_tables(frozen_table, scroll_table, len(rows))
+
         container = QWidget()
         h_layout = QHBoxLayout(container)
         h_layout.setContentsMargins(0, 0, 0, 0)
         h_layout.setSpacing(0)
         h_layout.addWidget(frozen_table)
         h_layout.addWidget(scroll_table, stretch=1)
-
         return container
 
     def _build_population_tab(self, population):
@@ -4621,7 +4727,9 @@ class MultiCubeVisualizer:
             return actor
 
         # Build actors in parallel — results come back in submission order
-        n_workers = min(8, len(atom_params))
+        # max(1, ...) — ThreadPoolExecutor rejects max_workers=0, which a
+        # cube carrying no atoms would otherwise produce.
+        n_workers = max(1, min(8, len(atom_params)))
         with ThreadPoolExecutor(max_workers=n_workers) as pool:
             actors = list(pool.map(build_actor, atom_params))
 
@@ -4668,43 +4776,60 @@ class MultiCubeVisualizer:
         self._pending_isovalue = None
         self.update_isovalue(value)
 
-    def _current_population_summary(self):
+    def _population_entry_for_current_cube(self):
+        """
+        The population record matching the cube on screen, or None.
+
+        Cubes are matched to orbitals by file name, which is what the orbital
+        'label' holds for a computed cube.
+        """
         if not self.source_details:
             return None
         population = self.source_details.get("population_analysis")
         if not population:
             return None
+
         current_name = os.path.basename(self.cube_files[self.current_cube_index])
-        orbitals = self.source_details.get("orbitals", [])
         target_index = None
-        for orb in orbitals:
+        for orb in self.source_details.get("orbitals", []):
             if orb.get("label") == current_name:
                 target_index = orb.get("index")
                 break
         if target_index is None:
             return None
+
         for entry in population.get("orbitals", []):
             if entry.get("index") == target_index:
-                occ = entry.get("occupation")
-                energy = entry.get("energy")
-                lines = [f"Orbital {target_index} Population"]
-                if energy is not None:
-                    lines.append(f"E = {energy:.4f} Ha")
-                if occ is not None:
-                    lines.append(f"occ = {occ:.3f}")
-
-                for contrib in entry.get("contribs", []):
-                    pct_total = contrib.get("percent", 0.0)
-                    if pct_total < 0.1:
-                        continue
-                    sym = contrib.get("symbol", "??")
-                    atom = contrib.get("atom", "")
-                    hybrid = contrib.get("hybrid", "")
-                    lines.append(
-                        f"{pct_total:6.3f}%  {sym} {atom:<3d}  {hybrid}"
-                    )
-                return "\n".join(lines)
+                return target_index, entry
         return None
+
+    @staticmethod
+    def _population_summary_lines(target_index, entry):
+        """Format one orbital's population breakdown for the viewport overlay."""
+        lines = [f"Orbital {target_index} Population"]
+        energy = entry.get("energy")
+        occ = entry.get("occupation")
+        if energy is not None:
+            lines.append(f"E = {energy:.4f} Ha")
+        if occ is not None:
+            lines.append(f"occ = {occ:.3f}")
+
+        for contrib in entry.get("contribs", []):
+            pct_total = contrib.get("percent", 0.0)
+            if pct_total < 0.1:
+                continue
+            lines.append(
+                f"{pct_total:6.3f}%  {contrib.get('symbol', '??')} "
+                f"{contrib.get('atom', ''):<3d}  {contrib.get('hybrid', '')}"
+            )
+        return lines
+
+    def _current_population_summary(self):
+        found = self._population_entry_for_current_cube()
+        if found is None:
+            return None
+        target_index, entry = found
+        return "\n".join(self._population_summary_lines(target_index, entry))
 
     def _update_population_overlay(self):
         if self.population_actor:
@@ -4936,6 +5061,104 @@ class MultiCubeVisualizer:
         self._update_population_overlay()
         self.plotter.render()
 
+    @staticmethod
+    def _warm_basis_cache(stem):
+        """
+        Parse the basis file beside *stem* once, to seed nbo_read's parse cache
+        before the key files are listed.
+
+        The parsed value itself is unused here -- the key-file labels below come
+        from the file extension alone.  The call is kept because it primes the
+        cache that a later population analysis of this source will hit.
+        """
+        import nbo_read as _nr
+        try:
+            for candidate in (stem + ".47", stem + ".31"):
+                if not os.path.exists(candidate):
+                    continue
+                if os.path.splitext(candidate)[1].lower() == ".47":
+                    return _nr.parse_file47(candidate)[0]
+                return _nr.parse_file31(candidate)[0]
+        except Exception:
+            pass        # fall back to per-file parsing
+        return None
+
+    # Siblings of an NBO basis file that are never key files.
+    _NBO_KEY_SKIP_EXTS = {
+        ".31", ".47", ".cube", ".log", ".out", ".txt",
+        ".py", ".json", ".png", ".pdf", ".svg",
+    }
+
+    def _nbo_basis_options(self):
+        """
+        Basis choices offered for population analysis of an NBO source: the AO
+        basis plus one entry per sibling key file found next to it.
+        """
+        import glob
+
+        import nbo_read as _nr
+
+        options = []
+        basis_source_path = self.source_details.get("basis_source_path")
+        stem_source = basis_source_path or self.source_details.get("source_path")
+        if not stem_source:
+            return options
+
+        stem = os.path.splitext(stem_source)[0]
+        dirpath = os.path.dirname(stem_source) or "."
+        base = os.path.basename(stem)
+        self._warm_basis_cache(stem)
+
+        for key_file in sorted(glob.glob(os.path.join(dirpath, base + ".*"))):
+            if os.path.splitext(key_file)[1].lower() in self._NBO_KEY_SKIP_EXTS:
+                continue
+            # Fast extension-based lookup (no file I/O)
+            orb_type = _nr.get_orbital_type_from_extension(key_file)
+            name = os.path.basename(key_file)
+            label = f"{orb_type} ({name})" if orb_type else f"Key basis ({name})"
+            options.append((label, {"kind": "nbo_key", "key_path": key_file}))
+        return options
+
+    def _prompt_population_basis(self, basis_options):
+        """
+        Ask which basis to analyse in.  Returns the chosen value, or None if
+        the user cancelled.
+        """
+        dlg = QDialog(self.main_window)
+        dlg.setWindowTitle("Population Analysis Options")
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel("Select basis for population analysis:"))
+        basis_combo = QComboBox()
+        for label, value in basis_options:
+            basis_combo.addItem(label, value)
+        layout.addWidget(basis_combo)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        layout.addWidget(btns)
+        if dlg.exec_() != QDialog.Accepted:
+            return None
+        return basis_combo.currentData()
+
+    def _start_population_thread(self, selected_basis):
+        """Show the progress dialog and kick off the analysis worker."""
+        self.source_details["_population_loading"] = True
+        self.refresh_metadata()
+
+        self._population_progress = QProgressDialog(
+            "Computing population analysis...", None, 0, 0, self.main_window)
+        self._population_progress.setWindowTitle("Population Analysis")
+        self._population_progress.setCancelButton(None)
+        self._population_progress.setMinimumDuration(0)
+        self._population_progress.setWindowModality(Qt.WindowModal)
+        self._population_progress.show()
+
+        self._population_thread = _PopulationAnalysisThread(
+            self.source_details, selected_basis, self.main_window)
+        self._population_thread.finished.connect(self._on_population_analysis_ready)
+        self._population_thread.error.connect(self._on_population_analysis_error)
+        self._population_thread.start()
+
     def _request_population_analysis(self):
         if not self.source_details:
             return
@@ -4946,99 +5169,17 @@ class MultiCubeVisualizer:
 
         # Determine available basis options (NBO sources only)
         basis_options = [("AO (Atomic Orbital)", "AO")]
-        source_path = self.source_details.get("source_path")
-        source_type = str(self.source_details.get("source_type", "")).lower()
-        show_dialog = False
-        
-        if source_type == "nbo":
-            import nbo_read as _nr
-            import glob
+        if str(self.source_details.get("source_type", "")).lower() == "nbo":
+            basis_options.extend(self._nbo_basis_options())
 
-            basis_source_path = self.source_details.get("basis_source_path")
-            stem_source = basis_source_path or source_path
-            if stem_source:
-                stem = os.path.splitext(stem_source)[0]
-                dirpath = os.path.dirname(stem_source) or "."
-                base = os.path.basename(stem)
-                candidates = sorted(glob.glob(os.path.join(dirpath, base + ".*")))
-                skip_exts = {
-                    ".31", ".47", ".cube", ".log", ".out", ".txt",
-                    ".py", ".json", ".png", ".pdf", ".svg",
-                }
-
-                # get_orbital_count() re-parses the basis file just to count
-                # basis functions -- parse it once here and hand the result
-                # to every key file below, instead of once per key file (all
-                # of them share this same basis file). Same fix as
-                # _KeyFilePickerDialog.
-                basis_info_dict = None
-                try:
-                    for basis_candidate in (stem + ".47", stem + ".31"):
-                        if os.path.exists(basis_candidate):
-                            basis_ext = os.path.splitext(basis_candidate)[1].lower()
-                            if basis_ext == ".47":
-                                basis_info_dict, _, _, _ = _nr.parse_file47(basis_candidate)
-                            else:
-                                basis_info_dict, _, _, _ = _nr.parse_file31(basis_candidate)
-                            break
-                except Exception:
-                    basis_info_dict = None  # fall back to per-file parsing below
-
-                for key_file in candidates:
-                    ext = os.path.splitext(key_file)[1].lower()
-                    if ext in skip_exts:
-                        continue
-                    # Fast extension-based lookup (no file I/O)
-                    orb_type = _nr.get_orbital_type_from_extension(key_file)
-                    if orb_type:
-                        label = f"{orb_type} ({os.path.basename(key_file)})"
-                    else:
-                        label = f"Key basis ({os.path.basename(key_file)})"
-                    basis_options.append((
-                        label,
-                        {"kind": "nbo_key", "key_path": key_file},
-                    ))
-            show_dialog = len(basis_options) > 1  # Only show if there are alternatives
-
-        # Show basis selection dialog only if there are options
+        # Only prompt when there is actually an alternative to AO
         selected_basis = "AO"
-        if show_dialog:
-            dlg = QDialog(self.main_window)
-            dlg.setWindowTitle("Population Analysis Options")
-            layout = QVBoxLayout(dlg)
-            layout.addWidget(QLabel("Select basis for population analysis:"))
-            basis_combo = QComboBox()
-            for label, value in basis_options:
-                basis_combo.addItem(label, value)
-            layout.addWidget(basis_combo)
-            btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-            btns.accepted.connect(dlg.accept)
-            btns.rejected.connect(dlg.reject)
-            layout.addWidget(btns)
-            if dlg.exec_() != QDialog.Accepted:
+        if len(basis_options) > 1:
+            selected_basis = self._prompt_population_basis(basis_options)
+            if selected_basis is None:
                 return
-            selected_basis = basis_combo.currentData()
 
-        self.source_details["_population_loading"] = True
-        self.refresh_metadata()
-
-        self._population_progress = QProgressDialog(
-            "Computing population analysis...",
-            None,
-            0,
-            0,
-            self.main_window,
-        )
-        self._population_progress.setWindowTitle("Population Analysis")
-        self._population_progress.setCancelButton(None)
-        self._population_progress.setMinimumDuration(0)
-        self._population_progress.setWindowModality(Qt.WindowModal)
-        self._population_progress.show()
-
-        self._population_thread = _PopulationAnalysisThread(self.source_details, selected_basis, self.main_window)
-        self._population_thread.finished.connect(self._on_population_analysis_ready)
-        self._population_thread.error.connect(self._on_population_analysis_error)
-        self._population_thread.start()
+        self._start_population_thread(selected_basis)
 
     def _clear_population_progress(self):
         if self._population_progress is not None:
@@ -5665,36 +5806,39 @@ class MultiCubeVisualizer:
 
     # ── Feature 5: Export all cubes as image sequence ─────────────────────────
 
-    def export_image_sequence(self):
-        if len(self.cubes) < 1:
-            QMessageBox.information(self.main_window, "Export Sequence",
-                                    "Load at least one cube file first.")
-            return
+    def _build_export_sequence_dialog(self):
+        """
+        The export-sequence options dialog.
+
+        Returns (dialog, read_options, button_box) where read_options() pulls
+        the current widget values as a dict.
+        """
         dlg = QDialog(self.main_window)
         dlg.setWindowTitle("Export Image Sequence")
         dlg.setMinimumWidth(380)
         lay = QVBoxLayout(dlg)
+
         lay.addWidget(QLabel("Output folder:"))
         folder_row = QHBoxLayout()
         folder_edit = QLineEdit(_default_dir())
-        folder_btn  = QPushButton("Browse…")
+        folder_btn = QPushButton("Browse…")
+
         def browse_folder():
-            _qd = QFileDialog(dlg, "Select output folder")
-            _qd.setOption(QFileDialog.DontUseNativeDialog)
-            _qd.setDirectory(_default_dir())
-            _qd.setFileMode(QFileDialog.Directory)
-            _qd.setOption(QFileDialog.ShowDirsOnly)
-            d = _qd.selectedFiles()[0] if _qd.exec_() else ""
-            _remember_dir(d)
-            if d: folder_edit.setText(d)
+            d = self._prompt_directory(dlg)
+            if d:
+                folder_edit.setText(d)
+
         folder_btn.clicked.connect(browse_folder)
-        folder_row.addWidget(folder_edit); folder_row.addWidget(folder_btn)
+        folder_row.addWidget(folder_edit)
+        folder_row.addWidget(folder_btn)
         lay.addLayout(folder_row)
+
         prefix_row = QHBoxLayout()
         prefix_row.addWidget(QLabel("Filename prefix:"))
         prefix_edit = QLineEdit("frame")
         prefix_row.addWidget(prefix_edit)
         lay.addLayout(prefix_row)
+
         scale_row = QHBoxLayout()
         scale_row.addWidget(QLabel("Resolution:"))
         scale_combo = QComboBox()
@@ -5702,95 +5846,225 @@ class MultiCubeVisualizer:
         scale_combo.setCurrentIndex(1)
         scale_row.addWidget(scale_combo)
         lay.addLayout(scale_row)
+
         transp_seq_check = QCheckBox("Transparent background")
         transp_seq_check.setChecked(False)
-        transp_seq_check.setToolTip("Export PNGs with alpha channel — no background colour")
+        transp_seq_check.setToolTip(
+            "Export PNGs with alpha channel — no background colour")
         lay.addWidget(transp_seq_check)
+
         lay.addWidget(QLabel(
             f"Will export {len(self.cubes)} PNG(s) at current\n"
             "viewpoint, isovalue and rendering settings."))
+
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.button(QDialogButtonBox.Ok).setText("Export")
         lay.addWidget(btns)
-        btns.rejected.connect(dlg.reject)
-        def do_export():
-            folder = folder_edit.text()
-            prefix = prefix_edit.text() or "frame"
-            scale  = int(scale_combo.currentText().rstrip('x'))
-            transp = transp_seq_check.isChecked()
-            if not os.path.isdir(folder):
-                QMessageBox.warning(dlg, "Error", "Folder does not exist."); return
-            dlg.accept()
-            orig_idx = self.current_cube_index
-            # Save the live camera so the interactive view can be restored once
-            # export finishes.
-            cam     = self.plotter.renderer.GetActiveCamera()
-            sv_pos  = cam.GetPosition(); sv_foc = cam.GetFocalPoint()
-            sv_up   = cam.GetViewUp()
-            sv_dist = cam.GetDistance(); sv_par = cam.GetParallelScale()
 
-            # Establish the export viewpoint from the first frame's atom-fit,
-            # then reuse those exact camera params for every frame — so the
-            # whole sequence shares one fixed scale instead of each frame
-            # re-fitting (and potentially drifting) independently. Since the
-            # viewpoint is shared but orbitals overflow the atom-fit frame by
-            # different amounts, check every cube at that fixed orientation
-            # and back off to whichever needs the most zoom-out, so no frame
-            # in the sequence gets clipped.
-            self.switch_cube(0)
-            self._fit_camera_to_atoms()
-            worst_zoom = 1.0
-            for i in range(len(self.cubes)):
-                self.switch_cube(i)
-                worst_zoom = min(worst_zoom, self._scene_overflow_zoom())
-            self.switch_cube(0)
-            if worst_zoom != 1.0:
-                cam.Zoom(worst_zoom)
-                self.plotter.renderer.ResetCameraClippingRange()
-            exp_pos  = cam.GetPosition(); exp_foc = cam.GetFocalPoint()
-            exp_up   = cam.GetViewUp()
-            exp_dist = cam.GetDistance(); exp_par = cam.GetParallelScale()
+        def read_options():
+            return {
+                "folder": folder_edit.text(),
+                "prefix": prefix_edit.text() or "frame",
+                "scale": int(scale_combo.currentText().rstrip('x')),
+                "transparent": transp_seq_check.isChecked(),
+            }
 
-            saved  = []
-            for i in range(len(self.cubes)):
-                self.switch_cube(i)
-                cam.SetPosition(exp_pos); cam.SetFocalPoint(exp_foc)
-                cam.SetViewUp(exp_up)
-                cam.SetDistance(exp_dist); cam.SetParallelScale(exp_par)
-                self.plotter.renderer.ResetCameraClippingRange()
-                self.plotter.render()
-                # Hide UI overlays
-                if self.title_actor:
-                    self.plotter.renderer.RemoveActor(self.title_actor)
-                self.plotter.hide_axes()
-                renderer  = self.plotter.renderer
-                actors_2d = renderer.GetActors2D()
-                actors_2d.InitTraversal(); hidden = []
-                a = actors_2d.GetNextActor2D()
-                while a: a.VisibilityOff(); hidden.append(a); a = actors_2d.GetNextActor2D()
-                renderer.GetRenderWindow().Render()
-                # scale= (magnification) instead of window_size= — see save_image
-                raw  = self.plotter.screenshot(return_img=True,
-                                               scale=scale,
-                                               transparent_background=transp)
-                for a in hidden: a.VisibilityOn()
-                self._update_title(); self.plotter.show_axes()
-                renderer.GetRenderWindow().Render()
-                out = os.path.join(folder, f"{prefix}_{i+1:04d}.png")
-                Image.fromarray(raw).save(out, format="PNG", dpi=(300, 300))
-                saved.append(out)
-            self.switch_cube(orig_idx)
-            # Restore the live view the user had before exporting
-            cam.SetPosition(sv_pos); cam.SetFocalPoint(sv_foc); cam.SetViewUp(sv_up)
-            cam.SetDistance(sv_dist); cam.SetParallelScale(sv_par)
+        return dlg, read_options, btns
+
+    @staticmethod
+    def _camera_state(cam):
+        """Snapshot the camera parameters this exporter sets and restores."""
+        return (cam.GetPosition(), cam.GetFocalPoint(), cam.GetViewUp(),
+                cam.GetDistance(), cam.GetParallelScale())
+
+    @staticmethod
+    def _restore_camera_state(cam, state):
+        position, focal_point, view_up, distance, parallel_scale = state
+        cam.SetPosition(position)
+        cam.SetFocalPoint(focal_point)
+        cam.SetViewUp(view_up)
+        cam.SetDistance(distance)
+        cam.SetParallelScale(parallel_scale)
+
+    def _establish_export_camera(self, cam):
+        """
+        Fix one viewpoint for the whole sequence and return its parameters.
+
+        The viewpoint comes from the first frame's atom-fit, so every frame
+        shares one scale instead of re-fitting (and potentially drifting)
+        independently.  Because orbitals overflow that atom-fit frame by
+        different amounts, every cube is checked at the fixed orientation and
+        the camera backs off to whichever needs the most zoom-out, so no frame
+        in the sequence gets clipped.
+        """
+        self.switch_cube(0)
+        self._fit_camera_to_atoms()
+        worst_zoom = 1.0
+        for i in range(len(self.cubes)):
+            self.switch_cube(i)
+            worst_zoom = min(worst_zoom, self._scene_overflow_zoom())
+        self.switch_cube(0)
+        if worst_zoom != 1.0:
+            cam.Zoom(worst_zoom)
+            self.plotter.renderer.ResetCameraClippingRange()
+        return self._camera_state(cam)
+
+    def _capture_frame(self, scale, transparent):
+        """
+        Screenshot the current cube with the UI overlays hidden, then put them
+        back.  Returns the raw RGB(A) array.
+        """
+        if self.title_actor:
+            self.plotter.renderer.RemoveActor(self.title_actor)
+        self.plotter.hide_axes()
+
+        renderer = self.plotter.renderer
+        actors_2d = renderer.GetActors2D()
+        actors_2d.InitTraversal()
+        hidden = []
+        a = actors_2d.GetNextActor2D()
+        while a:
+            a.VisibilityOff()
+            hidden.append(a)
+            a = actors_2d.GetNextActor2D()
+        renderer.GetRenderWindow().Render()
+
+        # scale= (magnification) instead of window_size= — see save_image
+        raw = self.plotter.screenshot(return_img=True, scale=scale,
+                                      transparent_background=transparent)
+
+        for a in hidden:
+            a.VisibilityOn()
+        self._update_title()
+        self.plotter.show_axes()
+        renderer.GetRenderWindow().Render()
+        return raw
+
+    def _write_image_sequence(self, options):
+        """Render and write one PNG per loaded cube; returns the paths written."""
+        folder = options["folder"]
+        orig_idx = self.current_cube_index
+        cam = self.plotter.renderer.GetActiveCamera()
+
+        # Save the live camera so the interactive view can be restored once
+        # export finishes.
+        live_camera = self._camera_state(cam)
+        export_camera = self._establish_export_camera(cam)
+
+        saved = []
+        for i in range(len(self.cubes)):
+            self.switch_cube(i)
+            self._restore_camera_state(cam, export_camera)
             self.plotter.renderer.ResetCameraClippingRange()
             self.plotter.render()
-            QMessageBox.information(self.main_window, "Done",
-                f"Exported {len(saved)} image(s) to:\n{folder}")
+            raw = self._capture_frame(options["scale"], options["transparent"])
+            out = os.path.join(folder, f"{options['prefix']}_{i+1:04d}.png")
+            Image.fromarray(raw).save(out, format="PNG", dpi=(300, 300))
+            saved.append(out)
+
+        self.switch_cube(orig_idx)
+        # Restore the live view the user had before exporting
+        self._restore_camera_state(cam, live_camera)
+        self.plotter.renderer.ResetCameraClippingRange()
+        self.plotter.render()
+        return saved
+
+    def export_image_sequence(self):
+        if len(self.cubes) < 1:
+            QMessageBox.information(self.main_window, "Export Sequence",
+                                    "Load at least one cube file first.")
+            return
+
+        dlg, read_options, btns = self._build_export_sequence_dialog()
+        btns.rejected.connect(dlg.reject)
+
+        def do_export():
+            options = read_options()
+            if not os.path.isdir(options["folder"]):
+                QMessageBox.warning(dlg, "Error", "Folder does not exist.")
+                return
+            dlg.accept()
+            saved = self._write_image_sequence(options)
+            QMessageBox.information(
+                self.main_window, "Done",
+                f"Exported {len(saved)} image(s) to:\n{options['folder']}")
+
         btns.accepted.connect(do_export)
         dlg.exec_()
 
     # ── Feature 9: Session save / restore ────────────────────────────────────
+
+    def _prompt_directory(self, parent, title="Select output folder"):
+        """Ask for an existing directory; returns "" if cancelled."""
+        _qd = QFileDialog(parent, title)
+        _qd.setOption(QFileDialog.DontUseNativeDialog)
+        _qd.setDirectory(_default_dir())
+        _qd.setFileMode(QFileDialog.Directory)
+        _qd.setOption(QFileDialog.ShowDirsOnly)
+        d = _qd.selectedFiles()[0] if _qd.exec_() else ""
+        _remember_dir(d)
+        return d
+
+    def _append_cube_to_list(self, fname, cube, marker=None, color=None):
+        """
+        Append one cube to the viewer and its list widget.
+
+        Signals are blocked around the insert so the row change does not
+        trigger a scene rebuild before the caller has finished loading.
+        Returns the new index.
+        """
+        idx = len(self.cube_files)
+        self.cube_files.append(fname)
+        self.cubes.append(cube)
+        if self.cube_list is not None:
+            label = os.path.basename(fname) if marker is None else fname + marker
+            item = QListWidgetItem(label)
+            if color is not None:
+                item.setForeground(QBrush(QColor(color)))
+            self.cube_list.blockSignals(True)
+            self.cube_list.addItem(item)
+            self.cube_list.blockSignals(False)
+        return idx
+
+    def _select_cube(self, idx):
+        """Focus a cube, going through the list widget when there is one."""
+        if self.cube_list is not None:
+            self.cube_list.setCurrentRow(idx)
+        else:
+            self.switch_cube(idx)
+
+    def _replace_cubes_with(self, paths, clear_selection=False):
+        """
+        Discard the loaded cubes and load *paths* in their place.
+
+        A file that will not parse is reported and skipped rather than
+        aborting the rest of the load.
+        """
+        self.cube_files = []
+        self.cubes = []
+        self.current_cube_index = 0
+        self._set_source_details(None)
+        if self.cube_list is not None:
+            self.cube_list.blockSignals(True)
+            self.cube_list.clear()
+            self.cube_list.blockSignals(False)
+        if clear_selection:
+            self.clear_selection()
+
+        first_new_idx = None
+        for fname in paths:
+            fname = os.path.abspath(fname)
+            try:
+                cube = self.read_cube(fname)
+            except Exception as e:
+                QMessageBox.warning(self.main_window, "Load Error",
+                                    f"Could not load:\n{fname}\n\n{e}")
+                continue
+            idx = self._append_cube_to_list(fname, cube)
+            if first_new_idx is None:
+                first_new_idx = idx
+        if first_new_idx is not None:
+            self._select_cube(first_new_idx)
 
     def open_cube_files_dialog(self):
         """Open a file dialog to select one or more .cube files (replaces current list)."""
@@ -5803,49 +6077,43 @@ class MultiCubeVisualizer:
         _remember_dir(fnames[0] if fnames else "")
         if not fnames:
             return
-        # Clear old data
-        self.cube_files = []; self.cubes = []; self.current_cube_index = 0
-        self._set_source_details(None)
-        if self.cube_list is not None:
-            self.cube_list.blockSignals(True); self.cube_list.clear()
-            self.cube_list.blockSignals(False)
-        self.clear_selection()
+        self._replace_cubes_with(fnames, clear_selection=True)
 
-        first_new_idx = None
-        for fname in fnames:
-            fname = os.path.abspath(fname)
-            try:
-                cube = self.read_cube(fname)
-                idx  = len(self.cube_files)
-                self.cube_files.append(fname); self.cubes.append(cube)
-                if self.cube_list is not None:
-                    self.cube_list.blockSignals(True)
-                    self.cube_list.addItem(QListWidgetItem(os.path.basename(fname)))
-                    self.cube_list.blockSignals(False)
-                if first_new_idx is None:
-                    first_new_idx = idx
-            except Exception as e:
-                QMessageBox.warning(self.main_window, "Load Error",
-                                    f"Could not load:\n{fname}\n\n{e}")
-        if first_new_idx is not None:
-            if self.cube_list is not None:
-                self.cube_list.setCurrentRow(first_new_idx)
-            else:
-                self.switch_cube(first_new_idx)
+    @staticmethod
+    def _populate_source_table(table, paths):
+        """Fill the source table with one row per path, flagging unknown types."""
+        table.setRowCount(0)
+        for path in paths:
+            kind = _recognize_source_type(path)
+            row = table.rowCount()
+            table.insertRow(row)
+            item_path = QTableWidgetItem(os.path.basename(path))
+            item_path.setToolTip(path)
+            item_type = QTableWidgetItem(
+                _source_type_label(kind) if kind else "Unknown")
+            if kind is None:
+                item_type.setForeground(QColor("#f38ba8"))
+            table.setItem(row, 0, item_path)
+            table.setItem(row, 1, item_type)
 
-    def open_source_files_dialog(self):
-        """Open supported source files and recognise their type in one table."""
-        dlg = QDialog(self.main_window)
-        dlg.setWindowTitle("Open Source Files")
-        dlg.setMinimumWidth(700)
-        layout = QVBoxLayout(dlg)
+    @staticmethod
+    def _unsupported_paths_in(table):
+        """Paths listed in the source table whose type is not recognised."""
+        bad = []
+        for row in range(table.rowCount()):
+            item_path = table.item(row, 0)
+            path = item_path.toolTip() if item_path else None
+            if _recognize_source_type(path) is None:
+                bad.append(path)
+        return bad
 
-        tabs = QTabWidget()
-        layout.addWidget(tabs)
-
-        # Browse tab
-        browse_tab = QWidget()
-        browse_layout = QVBoxLayout(browse_tab)
+    def _build_source_browse_tab(self, dlg):
+        """
+        The Browse tab: a table of chosen files with the type recognised for
+        each.  Returns (tab, table, load_callback_wiring_done).
+        """
+        tab = QWidget()
+        browse_layout = QVBoxLayout(tab)
         label = QLabel(
             "Select one or more supported source files and confirm the recognised "
             "type before loading. Supported files: .cube, .47/.31, .fchk/.fck, .molden.")
@@ -5876,55 +6144,13 @@ class MultiCubeVisualizer:
         btn_row.addWidget(cancel_btn)
         browse_layout.addLayout(btn_row)
 
-        tabs.addTab(browse_tab, "Browse")
-
-        # Recent tab
-        recent_tab = QWidget()
-        recent_layout = QVBoxLayout(recent_tab)
-        recent_label = QLabel("Select recent files to load.")
-        recent_layout.addWidget(recent_label)
-
-        recent_list = QListWidget()
-        recent_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        recent_list.setMinimumHeight(240)
-        recent_layout.addWidget(recent_list)
-
-        recent_btn_row = QHBoxLayout()
-        load_recent_btn = QPushButton("Load Selected")
-        remove_recent_btn = QPushButton("Remove Selected")
-        clear_recent_btn = QPushButton("Clear All")
-        recent_btn_row.addWidget(load_recent_btn)
-        recent_btn_row.addWidget(remove_recent_btn)
-        recent_btn_row.addWidget(clear_recent_btn)
-        recent_layout.addLayout(recent_btn_row)
-
-        tabs.addTab(recent_tab, "Recent")
-
-        # Populate recent list
-        for path in self.recent_files:
-            item = QListWidgetItem(os.path.basename(path))
-            item.setToolTip(path)
-            recent_list.addItem(item)
-
         def update_buttons():
             has_rows = table.rowCount() > 0
             remove_btn.setEnabled(has_rows and bool(table.selectedItems()))
             load_btn.setEnabled(has_rows)
 
         def add_paths(paths):
-            table.setRowCount(0)
-            for path in paths:
-                kind = _recognize_source_type(path)
-                label_text = _source_type_label(kind) if kind else "Unknown"
-                row = table.rowCount()
-                table.insertRow(row)
-                item_path = QTableWidgetItem(os.path.basename(path))
-                item_path.setToolTip(path)
-                item_type = QTableWidgetItem(label_text)
-                if kind is None:
-                    item_type.setForeground(QColor("#f38ba8"))
-                table.setItem(row, 0, item_path)
-                table.setItem(row, 1, item_type)
+            self._populate_source_table(table, paths)
             update_buttons()
 
         def browse_files():
@@ -5943,20 +6169,15 @@ class MultiCubeVisualizer:
                 add_paths(paths)
 
         def remove_selected():
-            selected_rows = sorted({item.row() for item in table.selectedItems()}, reverse=True)
-            for row in selected_rows:
+            for row in sorted({item.row() for item in table.selectedItems()},
+                              reverse=True):
                 table.removeRow(row)
             update_buttons()
 
         def accept_load():
             if table.rowCount() == 0:
                 return
-            bad_rows = []
-            for row in range(table.rowCount()):
-                item_path = table.item(row, 0)
-                path = item_path.toolTip() if item_path else None
-                if _recognize_source_type(path) is None:
-                    bad_rows.append(path)
+            bad_rows = self._unsupported_paths_in(table)
             if bad_rows:
                 QMessageBox.warning(
                     dlg, "Unsupported Files",
@@ -5965,7 +6186,38 @@ class MultiCubeVisualizer:
                 return
             dlg.accept()
 
-        # Recent functions
+        browse_btn.clicked.connect(browse_files)
+        remove_btn.clicked.connect(remove_selected)
+        load_btn.clicked.connect(accept_load)
+        cancel_btn.clicked.connect(dlg.reject)
+        table.itemSelectionChanged.connect(update_buttons)
+        return tab, table
+
+    def _build_source_recent_tab(self, dlg):
+        """The Recent tab: previously opened sources, loadable or removable."""
+        tab = QWidget()
+        recent_layout = QVBoxLayout(tab)
+        recent_layout.addWidget(QLabel("Select recent files to load."))
+
+        recent_list = QListWidget()
+        recent_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        recent_list.setMinimumHeight(240)
+        recent_layout.addWidget(recent_list)
+
+        recent_btn_row = QHBoxLayout()
+        load_recent_btn = QPushButton("Load Selected")
+        remove_recent_btn = QPushButton("Remove Selected")
+        clear_recent_btn = QPushButton("Clear All")
+        recent_btn_row.addWidget(load_recent_btn)
+        recent_btn_row.addWidget(remove_recent_btn)
+        recent_btn_row.addWidget(clear_recent_btn)
+        recent_layout.addLayout(recent_btn_row)
+
+        for path in self.recent_files:
+            item = QListWidgetItem(os.path.basename(path))
+            item.setToolTip(path)
+            recent_list.addItem(item)
+
         def load_recent():
             selected_items = recent_list.selectedItems()
             if not selected_items:
@@ -5975,10 +6227,7 @@ class MultiCubeVisualizer:
             self._load_source_files(paths)
 
         def remove_recent():
-            selected_items = recent_list.selectedItems()
-            if not selected_items:
-                return
-            for item in selected_items:
+            for item in recent_list.selectedItems():
                 path = item.toolTip()
                 if path in self.recent_files:
                     self.recent_files.remove(path)
@@ -5988,23 +6237,51 @@ class MultiCubeVisualizer:
             self.recent_files.clear()
             recent_list.clear()
 
-        browse_btn.clicked.connect(browse_files)
-        remove_btn.clicked.connect(remove_selected)
-        load_btn.clicked.connect(accept_load)
-        cancel_btn.clicked.connect(dlg.reject)
-        table.itemSelectionChanged.connect(update_buttons)
-
         load_recent_btn.clicked.connect(load_recent)
         remove_recent_btn.clicked.connect(remove_recent)
         clear_recent_btn.clicked.connect(clear_recent)
+        return tab
+
+    def open_source_files_dialog(self):
+        """Open supported source files and recognise their type in one table."""
+        dlg = QDialog(self.main_window)
+        dlg.setWindowTitle("Open Source Files")
+        dlg.setMinimumWidth(700)
+        layout = QVBoxLayout(dlg)
+
+        tabs = QTabWidget()
+        layout.addWidget(tabs)
+        browse_tab, table = self._build_source_browse_tab(dlg)
+        tabs.addTab(browse_tab, "Browse")
+        tabs.addTab(self._build_source_recent_tab(dlg), "Recent")
 
         if dlg.exec_() != QDialog.Accepted:
             return
 
-        # Only load from browse tab if accepted
+        # Only load from browse tab if accepted; the Recent tab loads directly
+        # from its own button and accepts the dialog afterwards.
         if tabs.currentIndex() == 0 and table.rowCount() > 0:
             paths = [table.item(r, 0).toolTip() for r in range(table.rowCount())]
             self._load_source_files(paths)
+
+    def _open_source_picker(self, path, kind):
+        """Run the orbital picker that matches this source format."""
+        if kind == "nbo":
+            dlg = _KeyFilePickerDialog(path, self.main_window)
+        elif kind == "fchk":
+            dlg = _FchkOrbitalPickerDialog(path, self.main_window)
+        else:
+            dlg = _MoldenOrbitalPickerDialog(path, self.main_window)
+        dlg.cubes_ready.connect(self._load_computed_cubes)
+        _DialogCenterFilter.center(dlg)
+        dlg.exec_()
+
+    def _remember_recent(self, paths):
+        """Push *paths* onto the recent list, newest first, capped at ten."""
+        for path in paths:
+            if path not in self.recent_files:
+                self.recent_files.insert(0, path)
+        self.recent_files = self.recent_files[:10]
 
     def _load_source_files(self, paths):
         sources = defaultdict(list)
@@ -6025,39 +6302,11 @@ class MultiCubeVisualizer:
 
         # Load cube files first
         if sources.get("cube"):
-            self.cube_files = []
-            self.cubes = []
-            self.current_cube_index = 0
-            self._set_source_details(None)
-            if self.cube_list is not None:
-                self.cube_list.blockSignals(True)
-                self.cube_list.clear()
-                self.cube_list.blockSignals(False)
-            first_new_idx = None
-            for fname in sources["cube"]:
-                fname = os.path.abspath(fname)
-                try:
-                    cube = self.read_cube(fname)
-                    idx = len(self.cube_files)
-                    self.cube_files.append(fname)
-                    self.cubes.append(cube)
-                    if self.cube_list is not None:
-                        self.cube_list.blockSignals(True)
-                        self.cube_list.addItem(QListWidgetItem(os.path.basename(fname)))
-                        self.cube_list.blockSignals(False)
-                    if first_new_idx is None:
-                        first_new_idx = idx
-                except Exception as e:
-                    QMessageBox.warning(self.main_window, "Load Error",
-                                        f"Could not load:\n{fname}\n\n{e}")
-            if first_new_idx is not None:
-                if self.cube_list is not None:
-                    self.cube_list.setCurrentRow(first_new_idx)
-                else:
-                    self.switch_cube(first_new_idx)
+            self._replace_cubes_with(sources["cube"])
 
         # Load a single structural source file if requested
-        special = sources.get("nbo", []) + sources.get("fchk", []) + sources.get("molden", [])
+        special = (sources.get("nbo", []) + sources.get("fchk", [])
+                   + sources.get("molden", []))
         if len(special) > 1:
             QMessageBox.information(
                 self.main_window, "Multiple Source Files",
@@ -6066,59 +6315,100 @@ class MultiCubeVisualizer:
             )
             return
         if special:
-            path = special[0]
-            kind = _recognize_source_type(path)
-            if kind == "nbo":
-                dlg = _KeyFilePickerDialog(path, self.main_window)
-            elif kind == "fchk":
-                dlg = _FchkOrbitalPickerDialog(path, self.main_window)
-            else:
-                dlg = _MoldenOrbitalPickerDialog(path, self.main_window)
-            dlg.cubes_ready.connect(self._load_computed_cubes)
-            _DialogCenterFilter.center(dlg)
-            dlg.exec_()
+            self._open_source_picker(special[0], _recognize_source_type(special[0]))
 
-        # Update recent files
-        for path in paths:
-            if path not in self.recent_files:
-                self.recent_files.insert(0, path)
-        self.recent_files = self.recent_files[:10]
+        self._remember_recent(paths)
 
-    def open_cube_operations_dialog(self):
-        """Show the cube operations dialog."""
-        if len(self.cubes) < 1:
-            QMessageBox.information(self.main_window, "Cube Operations",
-                                    "Load at least one cube file first.")
-            return
+    @staticmethod
+    def _apply_cube_operation(op, cube_a, cube_b, scalar):
+        """
+        Evaluate one cube-algebra expression.
+
+        Division guards against a near-zero denominator by returning 0 there,
+        rather than propagating inf/nan into the grid.  Raises ValueError when
+        a two-cube operation is given grids of different shapes.
+        """
+        if "scalar" in op:
+            return cube_a['data'] * scalar
+        if cube_a['dimensions'] != cube_b['dimensions']:
+            raise ValueError(
+                f"Cubes have different grid dimensions:\n"
+                f"  A: {cube_a['dimensions']}\n  B: {cube_b['dimensions']}")
+        if op == "A + B":
+            return cube_a['data'] + cube_b['data']
+        if op == "A \u2212 B":
+            return cube_a['data'] - cube_b['data']
+        if op == "A \u00d7 B":
+            return cube_a['data'] * cube_b['data']
+        with np.errstate(divide='ignore', invalid='ignore'):
+            return np.where(np.abs(cube_b['data']) > 1e-30,
+                            cube_a['data'] / cube_b['data'], 0.0)
+
+    @staticmethod
+    def _cube_like(base_cube, data):
+        """A new cube sharing *base_cube*'s geometry but carrying *data*."""
+        return dict(origin=base_cube['origin'], spacing=base_cube['spacing'],
+                    dimensions=base_cube['dimensions'],
+                    atoms=base_cube['atoms'].copy(),
+                    coordinates=base_cube['coordinates'].copy(),
+                    data=data, bonds=base_cube['bonds'],
+                    unit_bohr=base_cube['unit_bohr'])
+
+    def _build_cube_operations_dialog(self):
+        """The cube-algebra dialog.  Returns (dlg, read_options, button_box)."""
         dlg = QDialog(self.main_window)
-        dlg.setWindowTitle("Cube Operations"); dlg.setMinimumWidth(420)
+        dlg.setWindowTitle("Cube Operations")
+        dlg.setMinimumWidth(420)
         layout = QVBoxLayout(dlg)
         names = [os.path.basename(f) for f in self.cube_files]
-        op_box = QGroupBox("Operation"); op_grid = QGridLayout(op_box)
+
+        op_box = QGroupBox("Operation")
+        op_grid = QGridLayout(op_box)
         op_combo = QComboBox()
-        op_combo.addItems(["A + B", "A \u2212 B", "A \u00d7 B", "A \u00f7 B", "A \u00d7 scalar"])
-        op_grid.addWidget(QLabel("Operation:"), 0, 0); op_grid.addWidget(op_combo, 0, 1, 1, 2)
+        op_combo.addItems(["A + B", "A \u2212 B", "A \u00d7 B", "A \u00f7 B",
+                           "A \u00d7 scalar"])
+        op_grid.addWidget(QLabel("Operation:"), 0, 0)
+        op_grid.addWidget(op_combo, 0, 1, 1, 2)
         op_grid.addWidget(QLabel("Cube A:"), 1, 0)
-        a_combo = QComboBox(); [a_combo.addItem(n) for n in names]
+        a_combo = QComboBox()
+        for n in names:
+            a_combo.addItem(n)
         op_grid.addWidget(a_combo, 1, 1, 1, 2)
-        b_label = QLabel("Cube B:"); b_combo = QComboBox()
-        [b_combo.addItem(n) for n in names]
-        if len(names) > 1: b_combo.setCurrentIndex(1)
-        op_grid.addWidget(b_label, 2, 0); op_grid.addWidget(b_combo, 2, 1, 1, 2)
+
+        b_label = QLabel("Cube B:")
+        b_combo = QComboBox()
+        for n in names:
+            b_combo.addItem(n)
+        if len(names) > 1:
+            b_combo.setCurrentIndex(1)
+        op_grid.addWidget(b_label, 2, 0)
+        op_grid.addWidget(b_combo, 2, 1, 1, 2)
+
         scalar_label = QLabel("Scalar value:")
-        scalar_spin = QDoubleSpinBox(); scalar_spin.setRange(-1e9,1e9)
-        scalar_spin.setDecimals(6); scalar_spin.setValue(1.0)
+        scalar_spin = QDoubleSpinBox()
+        scalar_spin.setRange(-1e9, 1e9)
+        scalar_spin.setDecimals(6)
+        scalar_spin.setValue(1.0)
         scalar_spin.setStepType(QDoubleSpinBox.AdaptiveDecimalStepType)
-        op_grid.addWidget(scalar_label, 3, 0); op_grid.addWidget(scalar_spin, 3, 1)
+        op_grid.addWidget(scalar_label, 3, 0)
+        op_grid.addWidget(scalar_spin, 3, 1)
+
         def on_op_changed(text):
             is_scalar = "scalar" in text
-            b_label.setVisible(not is_scalar); b_combo.setVisible(not is_scalar)
-            scalar_label.setVisible(is_scalar); scalar_spin.setVisible(is_scalar)
-        op_combo.currentTextChanged.connect(on_op_changed); on_op_changed(op_combo.currentText())
+            b_label.setVisible(not is_scalar)
+            b_combo.setVisible(not is_scalar)
+            scalar_label.setVisible(is_scalar)
+            scalar_spin.setVisible(is_scalar)
+
+        op_combo.currentTextChanged.connect(on_op_changed)
+        on_op_changed(op_combo.currentText())
         layout.addWidget(op_box)
-        out_box = QGroupBox("Output"); out_layout = QHBoxLayout(out_box)
+
+        out_box = QGroupBox("Output")
+        out_layout = QHBoxLayout(out_box)
         out_edit = QLineEdit("result.cube")
         out_btn = QPushButton("Browse…")
+
         def browse_out():
             _qd = QFileDialog(dlg, "Save result cube")
             _qd.setOption(QFileDialog.DontUseNativeDialog)
@@ -6129,61 +6419,75 @@ class MultiCubeVisualizer:
             _qd.setNameFilter("Cube Files (*.cube)")
             path = _qd.selectedFiles()[0] if _qd.exec_() else ""
             _remember_dir(path)
-            if path: out_edit.setText(path)
+            if path:
+                out_edit.setText(path)
+
         out_btn.clicked.connect(browse_out)
-        load_check = QCheckBox("Load result into viewer"); load_check.setChecked(True)
-        out_layout.addWidget(out_edit); out_layout.addWidget(out_btn)
-        out_layout.addWidget(load_check); layout.addWidget(out_box)
+        load_check = QCheckBox("Load result into viewer")
+        load_check.setChecked(True)
+        out_layout.addWidget(out_edit)
+        out_layout.addWidget(out_btn)
+        out_layout.addWidget(load_check)
+        layout.addWidget(out_box)
+
         btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btn_box.button(QDialogButtonBox.Ok).setText("Compute")
-        layout.addWidget(btn_box); btn_box.rejected.connect(dlg.reject)
-        def compute():
-            op = op_combo.currentText(); ca = self.cubes[a_combo.currentIndex()]
-            if "scalar" in op:
-                result_data = ca['data'] * scalar_spin.value(); base_cube = ca
-            else:
-                cb = self.cubes[b_combo.currentIndex()]
-                if ca['dimensions'] != cb['dimensions']:
-                    QMessageBox.warning(dlg, "Grid mismatch",
-                        f"Cubes have different grid dimensions:\n"
-                        f"  A: {ca['dimensions']}\n  B: {cb['dimensions']}"); return
-                if   op == "A + B":             result_data = ca['data'] + cb['data']
-                elif op == "A \u2212 B":         result_data = ca['data'] - cb['data']
-                elif op == "A \u00d7 B":         result_data = ca['data'] * cb['data']
-                else:
-                    with np.errstate(divide='ignore', invalid='ignore'):
-                        result_data = np.where(np.abs(cb['data']) > 1e-30,
-                                               ca['data'] / cb['data'], 0.0)
-                base_cube = ca
-            result_cube = dict(origin=base_cube['origin'], spacing=base_cube['spacing'],
-                               dimensions=base_cube['dimensions'],
-                               atoms=base_cube['atoms'].copy(),
-                               coordinates=base_cube['coordinates'].copy(),
-                               data=result_data, bonds=base_cube['bonds'],
-                               unit_bohr=base_cube['unit_bohr'])
+        layout.addWidget(btn_box)
+
+        def read_options():
             out_path = out_edit.text().strip() or "result.cube"
-            if not out_path.lower().endswith('.cube'): out_path += '.cube'
+            if not out_path.lower().endswith('.cube'):
+                out_path += '.cube'
+            return {
+                "op": op_combo.currentText(),
+                "cube_a": self.cubes[a_combo.currentIndex()],
+                "cube_b": self.cubes[b_combo.currentIndex()],
+                "scalar": scalar_spin.value(),
+                "out_path": out_path,
+                "load": load_check.isChecked(),
+            }
+
+        return dlg, read_options, btn_box
+
+    def open_cube_operations_dialog(self):
+        """Show the cube operations dialog."""
+        if len(self.cubes) < 1:
+            QMessageBox.information(self.main_window, "Cube Operations",
+                                    "Load at least one cube file first.")
+            return
+
+        dlg, read_options, btn_box = self._build_cube_operations_dialog()
+        btn_box.rejected.connect(dlg.reject)
+
+        def compute():
+            opts = read_options()
             try:
-                self._write_cube(result_cube, out_path, comment=f"CubeVisualizer: {op}")
+                result_data = self._apply_cube_operation(
+                    opts["op"], opts["cube_a"], opts["cube_b"], opts["scalar"])
+            except ValueError as e:
+                QMessageBox.warning(dlg, "Grid mismatch", str(e))
+                return
+
+            result_cube = self._cube_like(opts["cube_a"], result_data)
+            out_path = opts["out_path"]
+            try:
+                self._write_cube(result_cube, out_path,
+                                 comment=f"CubeVisualizer: {opts['op']}")
             except Exception as e:
-                QMessageBox.critical(dlg, "Write error", str(e)); return
+                QMessageBox.critical(dlg, "Write error", str(e))
+                return
+
             dlg.accept()
-            if load_check.isChecked():
-                idx = len(self.cube_files)
-                self.cube_files.append(out_path); self.cubes.append(result_cube)
-                if self.cube_list is not None:
-                    self.cube_list.blockSignals(True)
-                    self.cube_list.addItem(QListWidgetItem(os.path.basename(out_path)))
-                    self.cube_list.blockSignals(False)
+            if opts["load"]:
+                idx = self._append_cube_to_list(out_path, result_cube)
                 self.clear_selection()
-                if self.cube_list is not None:
-                    self.cube_list.setCurrentRow(idx)
-                else:
-                    self.switch_cube(idx)
+                self._select_cube(idx)
             else:
                 QMessageBox.information(self.main_window, "Done",
                                         f"Result saved to:\n{out_path}")
-        btn_box.accepted.connect(compute); dlg.exec_()
+
+        btn_box.accepted.connect(compute)
+        dlg.exec_()
 
     def save_session(self):
         _qd = QFileDialog(self.main_window, "Save Session")
@@ -6226,59 +6530,43 @@ class MultiCubeVisualizer:
         except Exception as e:
             QMessageBox.critical(self.main_window, "Save Error", str(e))
 
-    def load_session(self):
-        _qd = QFileDialog(self.main_window, "Load Session")
-        _qd.setOption(QFileDialog.DontUseNativeDialog)
-        _qd.setDirectory(_default_dir())
-        _qd.setFileMode(QFileDialog.ExistingFile)
-        _qd.setNameFilter("Session Files (*.json)")
-        fname = _qd.selectedFiles()[0] if _qd.exec_() else ""
-        _remember_dir(fname)
-        if not fname: return
-        try:
-            with open(fname) as f:
-                state = json.load(f)
-        except Exception as e:
-            QMessageBox.critical(self.main_window, "Load Error", str(e)); return
+    def _restore_session_cubes(self, valid):
+        """
+        Reload a session's cube files.
 
-        # Reload cube files
-        valid = [f for f in state.get('cube_files', []) if os.path.isfile(f)]
-        missing = [f for f in state.get('cube_files', []) if not os.path.isfile(f)]
-        if missing:
-            QMessageBox.warning(self.main_window, "Missing Files",
-                "Some cube files could not be found:\n" +
-                "\n".join(os.path.basename(m) for m in missing))
-        if not valid:
-            QMessageBox.critical(self.main_window, "No Files",
-                                 "No valid cube files found for this session.")
-            return
-
-        self.cube_files = []; self.cubes = []; self.current_cube_index = 0
+        Unlike the interactive loaders this stays silent on a file that will
+        not parse -- the session has already reported anything missing.
+        """
+        self.cube_files = []
+        self.cubes = []
+        self.current_cube_index = 0
         self._set_source_details(None)
         if self.cube_list is not None:
-            self.cube_list.blockSignals(True); self.cube_list.clear()
+            self.cube_list.blockSignals(True)
+            self.cube_list.clear()
         for f in valid:
             try:
                 self.cubes.append(self.read_cube(f))
                 self.cube_files.append(f)
                 if self.cube_list is not None:
                     self.cube_list.addItem(QListWidgetItem(os.path.basename(f)))
-            except Exception: pass
+            except Exception:
+                pass
         if self.cube_list is not None:
             self.cube_list.blockSignals(False)
 
-        # Restore scalar settings
-        self.current_isovalue  = state.get('isovalue', 0.03)
-        self.surface_opacity   = state.get('opacity', 1.0)
+    def _apply_session_settings(self, state):
+        """Restore the scalar view settings and the lobe colour scheme."""
+        self.current_isovalue = state.get('isovalue', 0.03)
+        self.surface_opacity = state.get('opacity', 1.0)
         self.current_mol_theme = state.get('mol_theme', 'Ball and Stick')
-        self.atom_scale        = state.get('atom_scale', 1.0)
-        self.bond_scale        = state.get('bond_scale', 1.0)
-        self.background_color  = state.get('background', 'black')
-        self.show_wireframe    = state.get('show_wireframe', True)
-        self.show_atom_labels  = state.get('show_labels', False)
-        self.ssao_enabled      = state.get('ssao', False)
+        self.atom_scale = state.get('atom_scale', 1.0)
+        self.bond_scale = state.get('bond_scale', 1.0)
+        self.background_color = state.get('background', 'black')
+        self.show_wireframe = state.get('show_wireframe', True)
+        self.show_atom_labels = state.get('show_labels', False)
+        self.ssao_enabled = state.get('ssao', False)
 
-        # Restore color scheme
         scheme = state.get('color_scheme', 'Mathematica (default)')
         if scheme in LOBE_COLOR_SCHEMES:
             self.lobe_pos_color, self.lobe_neg_color = LOBE_COLOR_SCHEMES[scheme]
@@ -6287,6 +6575,51 @@ class MultiCubeVisualizer:
                 self.color_scheme_combo.setCurrentText(scheme)
                 self.color_scheme_combo.blockSignals(False)
 
+    def _apply_session_camera(self, cam_state):
+        """Restore a saved camera position."""
+        if not cam_state:
+            return
+        cam = self.plotter.renderer.GetActiveCamera()
+        cam.SetPosition(*cam_state['position'])
+        cam.SetFocalPoint(*cam_state['focal'])
+        cam.SetViewUp(*cam_state['viewup'])
+        cam.SetDistance(cam_state['distance'])
+        self.plotter.renderer.ResetCameraClippingRange()
+        self.plotter.render()
+
+    def load_session(self):
+        _qd = QFileDialog(self.main_window, "Load Session")
+        _qd.setOption(QFileDialog.DontUseNativeDialog)
+        _qd.setDirectory(_default_dir())
+        _qd.setFileMode(QFileDialog.ExistingFile)
+        _qd.setNameFilter("Session Files (*.json)")
+        fname = _qd.selectedFiles()[0] if _qd.exec_() else ""
+        _remember_dir(fname)
+        if not fname:
+            return
+        try:
+            with open(fname) as f:
+                state = json.load(f)
+        except Exception as e:
+            QMessageBox.critical(self.main_window, "Load Error", str(e))
+            return
+
+        # Reload cube files
+        saved_files = state.get('cube_files', [])
+        valid = [f for f in saved_files if os.path.isfile(f)]
+        missing = [f for f in saved_files if not os.path.isfile(f)]
+        if missing:
+            QMessageBox.warning(self.main_window, "Missing Files",
+                                "Some cube files could not be found:\n" +
+                                "\n".join(os.path.basename(m) for m in missing))
+        if not valid:
+            QMessageBox.critical(self.main_window, "No Files",
+                                 "No valid cube files found for this session.")
+            return
+
+        self._restore_session_cubes(valid)
+        self._apply_session_settings(state)
+
         # Rebuild scene
         idx = min(state.get('current_index', 0), len(self.cubes) - 1)
         self.plotter.set_background(self.background_color)
@@ -6294,16 +6627,7 @@ class MultiCubeVisualizer:
         if self.cube_list is not None:
             self.cube_list.setCurrentRow(idx)
 
-        # Restore camera
-        cam_s = state.get('camera', {})
-        if cam_s:
-            cam = self.plotter.renderer.GetActiveCamera()
-            cam.SetPosition(*cam_s['position'])
-            cam.SetFocalPoint(*cam_s['focal'])
-            cam.SetViewUp(*cam_s['viewup'])
-            cam.SetDistance(cam_s['distance'])
-            self.plotter.renderer.ResetCameraClippingRange()
-            self.plotter.render()
+        self._apply_session_camera(state.get('camera', {}))
 
         QMessageBox.information(self.main_window, "Session Loaded",
                                 f"Session restored from:\n{fname}")
@@ -6743,52 +7067,60 @@ class MultiCubeVisualizer:
 
 # ── NBO / basis-file workflow ─────────────────────────────────────────────────
 
-    def save_cube_files_dialog(self):
-        """
-        Show a dialog listing all currently loaded cubes.  The user can select
-        which ones to save and choose an output folder.  In-memory cubes that
-        were never saved are highlighted.
-        """
-        if not self.cubes:
-            QMessageBox.information(self.main_window, "Save Cubes",
-                                    "No cube data is loaded yet.")
-            return
+    _SAVE_CUBES_STYLE = (
+        "QDialog{background:#1e1e2e;color:#cdd6f4;}"
+        "QLabel{color:#cdd6f4;}"
+        "QGroupBox{color:#89b4fa;border:1px solid #313244;border-radius:4px;"
+        "          margin-top:6px;padding-top:8px;}"
+        "QGroupBox::title{subcontrol-origin:margin;left:8px;color:#89b4fa;}"
+        "QListWidget{background:#181825;border:1px solid #313244;color:#cdd6f4;font-size:10pt;}"
+        "QListWidget::item{padding:5px 4px;border-bottom:1px solid #313244;}"
+        "QListWidget::item:selected{background:#89b4fa;color:#1e1e2e;font-weight:bold;}"
+        "QPushButton{background:#313244;color:#cdd6f4;border:1px solid #45475a;"
+        "            border-radius:4px;padding:5px 12px;}"
+        "QPushButton:hover{background:#45475a;}"
+        "QLineEdit{background:#313244;color:#cdd6f4;border:1px solid #45475a;"
+        "          border-radius:3px;padding:2px;}"
+    )
 
-        unsaved = getattr(self, '_unsaved_cubes', {})
+    @staticmethod
+    def _row_for_cube(lw, cube_idx):
+        """The list row holding *cube_idx*, or None."""
+        for row in range(lw.count()):
+            if lw.item(row).data(Qt.UserRole) == cube_idx:
+                return row
+        return None
 
+    def _build_save_cubes_dialog(self, unsaved):
+        """
+        The save-cubes dialog.  Returns (dlg, list_widget, folder_edit, status,
+        button_box).
+        """
         dlg = QDialog(self.main_window)
         dlg.setWindowTitle("Save Cube Files")
         dlg.setMinimumWidth(480)
-        dlg.setStyleSheet(
-            "QDialog{background:#1e1e2e;color:#cdd6f4;}"
-            "QLabel{color:#cdd6f4;}"
-            "QGroupBox{color:#89b4fa;border:1px solid #313244;border-radius:4px;"
-            "          margin-top:6px;padding-top:8px;}"
-            "QGroupBox::title{subcontrol-origin:margin;left:8px;color:#89b4fa;}"
-            "QListWidget{background:#181825;border:1px solid #313244;color:#cdd6f4;font-size:10pt;}"
-            "QListWidget::item{padding:5px 4px;border-bottom:1px solid #313244;}"
-            "QListWidget::item:selected{background:#89b4fa;color:#1e1e2e;font-weight:bold;}"
-            "QPushButton{background:#313244;color:#cdd6f4;border:1px solid #45475a;"
-            "            border-radius:4px;padding:5px 12px;}"
-            "QPushButton:hover{background:#45475a;}"
-            "QLineEdit{background:#313244;color:#cdd6f4;border:1px solid #45475a;"
-            "          border-radius:3px;padding:2px;}"
-        )
-        lay = QVBoxLayout(dlg); lay.setSpacing(8)
+        dlg.setStyleSheet(self._SAVE_CUBES_STYLE)
+        lay = QVBoxLayout(dlg)
+        lay.setSpacing(8)
 
         note = QLabel(
             "Select which orbitals to save.  "
             "<span style='color:#a6e3a1'>Green ●</span> = in-memory (not yet on disk).")
-        note.setWordWrap(True); lay.addWidget(note)
+        note.setWordWrap(True)
+        lay.addWidget(note)
 
-        grp = QGroupBox("Loaded cubes"); glay = QVBoxLayout(grp)
+        grp = QGroupBox("Loaded cubes")
+        glay = QVBoxLayout(grp)
 
         sel_row = QHBoxLayout()
-        all_b  = QPushButton("Select All")
+        all_b = QPushButton("Select All")
         none_b = QPushButton("Select None")
-        uns_b  = QPushButton("Select Unsaved")
-        sel_row.addWidget(all_b); sel_row.addWidget(none_b); sel_row.addWidget(uns_b)
-        sel_row.addStretch(); glay.addLayout(sel_row)
+        uns_b = QPushButton("Select Unsaved")
+        sel_row.addWidget(all_b)
+        sel_row.addWidget(none_b)
+        sel_row.addWidget(uns_b)
+        sel_row.addStretch()
+        glay.addLayout(sel_row)
 
         lw = QListWidget()
         lw.setSelectionMode(QAbstractItemView.MultiSelection)
@@ -6806,31 +7138,30 @@ class MultiCubeVisualizer:
 
         all_b.clicked.connect(lw.selectAll)
         none_b.clicked.connect(lw.clearSelection)
+
         def sel_unsaved():
             lw.clearSelection()
             for row in range(lw.count()):
                 if lw.item(row).data(Qt.UserRole) in unsaved:
                     lw.item(row).setSelected(True)
+
         uns_b.clicked.connect(sel_unsaved)
 
-        # Output folder
-        fgrp = QGroupBox("Output folder"); flay = QHBoxLayout(fgrp)
+        fgrp = QGroupBox("Output folder")
+        flay = QHBoxLayout(fgrp)
         folder_edit = QLineEdit(_default_dir())
-        browse_btn  = QPushButton("Browse…")
+        browse_btn = QPushButton("Browse…")
+
         def browse():
-            _qd = QFileDialog(dlg, "Select output folder")
-            _qd.setOption(QFileDialog.DontUseNativeDialog)
-            _qd.setDirectory(_default_dir())
-            _qd.setFileMode(QFileDialog.Directory)
-            _qd.setOption(QFileDialog.ShowDirsOnly)
-            d = _qd.selectedFiles()[0] if _qd.exec_() else ""
-            _remember_dir(d)
-            if d: folder_edit.setText(d)
+            d = self._prompt_directory(dlg)
+            if d:
+                folder_edit.setText(d)
+
         browse_btn.clicked.connect(browse)
-        flay.addWidget(folder_edit); flay.addWidget(browse_btn)
+        flay.addWidget(folder_edit)
+        flay.addWidget(browse_btn)
         lay.addWidget(fgrp)
 
-        # Status
         status = QLabel("")
         status.setStyleSheet("color:#a6adc8;font-size:9pt;")
         lay.addWidget(status)
@@ -6838,6 +7169,64 @@ class MultiCubeVisualizer:
         btns = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Close)
         btns.button(QDialogButtonBox.Save).setText("Save Selected")
         lay.addWidget(btns)
+        return dlg, lw, folder_edit, status, btns
+
+    def _mark_cube_saved(self, lw, cube_idx, base, out_path):
+        """Move a cube from "in memory" to "on disk" in both lists."""
+        row = self._row_for_cube(lw, cube_idx)
+        if row is not None:
+            item = lw.item(row)
+            item.setText(base)
+            item.setForeground(QBrush(QColor("#cdd6f4")))
+        self.cube_files[cube_idx] = out_path
+        if self.cube_list is not None and self.cube_list.item(cube_idx) is not None:
+            self.cube_list.blockSignals(True)
+            self.cube_list.item(cube_idx).setText(base)
+            self.cube_list.item(cube_idx).setForeground(QBrush(QColor("#cdd6f4")))
+            self.cube_list.blockSignals(False)
+
+    def _save_one_cube(self, cube_idx, folder, unsaved, lw):
+        """
+        Write one cube to *folder*.
+
+        An in-memory cube is written from its stored result dict; one already
+        on disk is copied.  Returns an error string, or None on success.
+        """
+        import shutil
+
+        import nbo_read as _nr
+
+        fname = self.cube_files[cube_idx]
+        # Derive a safe filename (strip unsaved marker if present)
+        base = os.path.basename(fname).rstrip(" ●").rstrip()
+        if not base.lower().endswith('.cube'):
+            base += '.cube'
+        out_path = os.path.join(folder, base)
+
+        try:
+            if cube_idx in unsaved:
+                _nr.write_cube_from_result(unsaved[cube_idx], out_path)
+                del unsaved[cube_idx]
+                self._mark_cube_saved(lw, cube_idx, base, out_path)
+            else:
+                shutil.copy2(fname, out_path)
+        except Exception as e:
+            return f"{base}: {e}"
+        return None
+
+    def save_cube_files_dialog(self):
+        """
+        Show a dialog listing all currently loaded cubes.  The user can select
+        which ones to save and choose an output folder.  In-memory cubes that
+        were never saved are highlighted.
+        """
+        if not self.cubes:
+            QMessageBox.information(self.main_window, "Save Cubes",
+                                    "No cube data is loaded yet.")
+            return
+
+        unsaved = getattr(self, '_unsaved_cubes', {})
+        dlg, lw, folder_edit, status, btns = self._build_save_cubes_dialog(unsaved)
         btns.rejected.connect(dlg.reject)
 
         def do_save():
@@ -6850,46 +7239,16 @@ class MultiCubeVisualizer:
             folder = folder_edit.text().strip()
             if not os.path.isdir(folder):
                 QMessageBox.warning(dlg, "Bad folder",
-                                    "The output folder does not exist."); return
-            import nbo_read as _nr
-            saved_count = 0
-            errors      = []
+                                    "The output folder does not exist.")
+                return
+
+            errors = []
             for cube_idx in selected_rows:
-                fname = self.cube_files[cube_idx]
-                # Derive a safe filename (strip unsaved marker if present)
-                base = os.path.basename(fname).rstrip(" ●").rstrip()
-                if not base.lower().endswith('.cube'):
-                    base += '.cube'
-                out_path = os.path.join(folder, base)
-                if cube_idx in unsaved:
-                    # In-memory cube — use write_cube_from_result
-                    try:
-                        _nr.write_cube_from_result(unsaved[cube_idx], out_path)
-                        # Update the list entry to show it is now saved
-                        del unsaved[cube_idx]
-                        item = lw.item(list(range(lw.count()))[
-                            [lw.item(r).data(Qt.UserRole) for r in range(lw.count())].index(cube_idx)])
-                        item.setText(base)
-                        item.setForeground(QBrush(QColor("#cdd6f4")))
-                        # Update cube_files to point to the real file
-                        self.cube_files[cube_idx] = out_path
-                        # Refresh cube list display
-                        if self.cube_list is not None:
-                            self.cube_list.blockSignals(True)
-                            self.cube_list.item(cube_idx).setText(base)
-                            self.cube_list.item(cube_idx).setForeground(
-                                QBrush(QColor("#cdd6f4")))
-                            self.cube_list.blockSignals(False)
-                        saved_count += 1
-                    except Exception as e:
-                        errors.append(f"{base}: {e}")
-                else:
-                    # Already-on-disk cube — copy it
-                    import shutil
-                    try:
-                        shutil.copy2(fname, out_path); saved_count += 1
-                    except Exception as e:
-                        errors.append(f"{base}: {e}")
+                error = self._save_one_cube(cube_idx, folder, unsaved, lw)
+                if error:
+                    errors.append(error)
+            saved_count = len(selected_rows) - len(errors)
+
             msg = f"Saved {saved_count} file(s) to:\n{folder}"
             if errors:
                 msg += "\n\nErrors:\n" + "\n".join(errors)
@@ -6946,6 +7305,36 @@ class MultiCubeVisualizer:
         dlg.cubes_ready.connect(self._load_computed_cubes)
         dlg.exec_()
 
+    def _clear_computed_cubes(self):
+        """
+        Drop every cube produced by a previous computation, so the list always
+        reflects the current basis/key file.
+
+        Indices are removed highest-first so earlier ones stay valid, and
+        signals are blocked throughout: otherwise each takeItem() fires
+        currentRowChanged and switch_cube() rebuilds the whole scene for every
+        remaining old cube, visibly "loading" the previous file's orbitals
+        before the new ones are added.
+        """
+        if self.cube_list is not None:
+            self.cube_list.blockSignals(True)
+        for idx in sorted(self._unsaved_cubes.keys(), reverse=True):
+            if idx < len(self.cubes):
+                del self.cubes[idx]
+                del self.cube_files[idx]
+            if self.cube_list is not None and self.cube_list.item(idx) is not None:
+                self.cube_list.takeItem(idx)
+        if self.cube_list is not None:
+            self.cube_list.blockSignals(False)
+        self._unsaved_cubes = {}
+
+        # Reset selection to last remaining cube (if any)
+        if self.cube_list is not None and self.cube_list.count() > 0:
+            self.current_cube_index = max(0, self.cube_list.count() - 1)
+            self.cube_list.setCurrentRow(self.current_cube_index)
+        elif not self.cubes:
+            self.current_cube_index = 0
+
     def _load_computed_cubes(self, results):
         """
         Receive a list of in-memory result dicts from _ComputeThread and load
@@ -6960,51 +7349,15 @@ class MultiCubeVisualizer:
         if results:
             self._set_source_details(results[0].get("source_details"))
 
-        # ── Remove all previously NBO-computed cubes ──────────────────────────
-        # Collect indices to remove (sorted descending so removal doesn't shift)
-        # blockSignals prevents each takeItem() from firing currentRowChanged
-        # (which shifts as rows are removed) -- without it, switch_cube() reran
-        # a full scene rebuild for every remaining old cube in between removals,
-        # visibly "loading" the previous file's orbitals before the new ones
-        # ever got added below.
-        nbo_indices = sorted(self._unsaved_cubes.keys(), reverse=True)
-        if self.cube_list is not None:
-            self.cube_list.blockSignals(True)
-        for idx in nbo_indices:
-            if idx < len(self.cubes):
-                del self.cubes[idx]
-                del self.cube_files[idx]
-            if self.cube_list is not None:
-                row = self.cube_list.item(idx)
-                if row is not None:
-                    self.cube_list.takeItem(idx)
-        if self.cube_list is not None:
-            self.cube_list.blockSignals(False)
-        self._unsaved_cubes = {}
+        self._clear_computed_cubes()
 
-        # Reset selection to last remaining cube (if any)
-        if self.cube_list is not None and self.cube_list.count() > 0:
-            self.current_cube_index = max(0, self.cube_list.count() - 1)
-            self.cube_list.setCurrentRow(self.current_cube_index)
-        elif not self.cubes:
-            self.current_cube_index = 0
-
-        # ── Load the new NBO orbitals ─────────────────────────────────────────
         first_new_idx = None
         for r in results:
             try:
-                cube  = self._result_to_cube(r)
-                label = r['label']
-                idx   = len(self.cube_files)
-                self.cube_files.append(label)
-                self.cubes.append(cube)
+                cube = self._result_to_cube(r)
+                idx = self._append_cube_to_list(
+                    r['label'], cube, marker="  ●", color="#a6e3a1")
                 self._unsaved_cubes[idx] = r   # keep result dict for saving
-                if self.cube_list is not None:
-                    self.cube_list.blockSignals(True)
-                    item = QListWidgetItem(label + "  ●")
-                    item.setForeground(QBrush(QColor("#a6e3a1")))
-                    self.cube_list.addItem(item)
-                    self.cube_list.blockSignals(False)
                 if first_new_idx is None:
                     first_new_idx = idx
             except Exception as e:
@@ -7015,10 +7368,7 @@ class MultiCubeVisualizer:
                     + traceback.format_exc())
 
         if first_new_idx is not None:
-            if self.cube_list is not None:
-                self.cube_list.setCurrentRow(first_new_idx)
-            else:
-                self.switch_cube(first_new_idx)
+            self._select_cube(first_new_idx)
 
     def _result_to_cube(self, r):
         """Convert a compute_cube_data result dict to a read_cube-style dict."""
