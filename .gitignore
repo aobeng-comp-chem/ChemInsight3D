@@ -1,4 +1,6 @@
 __pycache__/
+.pytest_cache
+.ruff_cache
 *.pyc
 *.pyo
 *.so
@@ -92,6 +94,10 @@ sto3g.fchk
 build_dist/
 test*/
 !tests/
-tests/*
-!tests/test_source_caching.py
+tests/__pycache__/
+tests/tmp_*.py
+.ruff_cache/
 .codex
+
+# Local commit helper
+commit.sh
