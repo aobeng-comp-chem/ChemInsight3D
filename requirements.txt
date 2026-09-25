@@ -1,0 +1,24 @@
+# Exact versions known to work with ChemInsight3D (Python 3.10, Linux/WSL).
+# Install with: python3 -m pip install -r requirements.txt
+
+# Numerics
+numpy==2.2.6
+scipy==1.15.3
+pandas==2.3.3
+
+# User interface and 3D rendering
+PyQt5==5.15.11
+PyQt5-Qt5==5.15.18
+PyQt5-sip==12.18.0
+pyvista==0.47.1
+pyvistaqt==0.11.3
+QtPy==2.4.3
+vtk==9.6.0
+matplotlib==3.10.8
+pillow==12.1.1
+
+# Building the C++ extensions
+pybind11==2.13.6
+
+# Tests
+pytest==9.1.1
