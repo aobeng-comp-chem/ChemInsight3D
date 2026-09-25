@@ -92,6 +92,8 @@ MOLDEN_*
 SeH_*
 sto3g.fchk
 build_dist/
+build/
+.build-venv/
 test*/
 !tests/
 tests/__pycache__/

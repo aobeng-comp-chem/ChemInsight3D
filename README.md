@@ -27,8 +27,12 @@ The program is developed on Linux/WSL with Python 3.10.
 - **To build the C++ extensions:** `pybind11`, plus a C++17 compiler with OpenMP (for example `g++`)
 - **To run the tests:** `pytest`
 
+`requirements.txt` pins the exact version of every package, so later releases cannot change how the program behaves. Install into a fresh virtual environment:
+
 ```bash
-python3 -m pip install numpy scipy pandas PyQt5 pyvista pyvistaqt vtk matplotlib pillow pybind11 pytest
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
 ```
 
 ## Building the C++ extensions (optional)
@@ -45,6 +49,27 @@ Rebuild with the same Python interpreter you use to run the program. These envir
 - `CXX`: the compiler to use.
 - `NO_OPENMP=1`: build without OpenMP.
 - `NO_MARCH_NATIVE=1`: do not optimize for the CPU of this machine.
+
+To check that the extensions load, run `python3 chemview.py --self-check`.
+
+## Standalone bundle
+
+`build_bundle.sh` uses PyInstaller to build a folder containing its own Python, every package at the version in `requirements.txt`, and portable builds of the C++ extensions. Nothing installed on the target machine is used, so package updates cannot break it.
+
+```bash
+./build_bundle.sh                               # uses python3 (must be Python 3.10)
+PYTHON=~/anaconda3/bin/python ./build_bundle.sh # or choose the Python to build with
+```
+
+The result is `build_dist/chemview/` (about 1.1 GB). Copy the whole folder to another machine and run:
+
+```bash
+build_dist/chemview/chemview                 # open the viewer
+build_dist/chemview/chemview a.cube          # open cube files at startup
+build_dist/chemview/chemview --self-check    # check that the C++ extensions load
+```
+
+The bundle runs on Linux x86-64 (including WSL) with a graphical desktop. A Windows or macOS bundle has to be built on that system.
 
 ## How to run
 

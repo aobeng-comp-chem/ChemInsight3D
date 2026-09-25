@@ -7703,6 +7703,26 @@ QGroupBox::title {{ subcontrol-origin:margin; left:8px; color:{t['accent']}; }}
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def _self_check():
+    """Report whether each C++ extension loads; return 0 if all do, else 1."""
+    import importlib
+    import overlap_matrix
+
+    # From source, overlap_matrix.py wraps the .so as _native. In a PyInstaller
+    # bundle the .so sits beside it under the same name and is imported directly.
+    native = getattr(overlap_matrix, "_native", overlap_matrix)
+    results = {"overlap_matrix": getattr(native, "__file__", None)}
+    for name in ("electron_density_opt_omp", "localization_native"):
+        try:
+            results[name] = importlib.import_module(name).__file__
+        except ImportError:
+            results[name] = None
+
+    for name, path in results.items():
+        print(f"{name:26s} {'OK   ' + path if path else 'MISSING (using Python fallback)'}")
+    return 0 if all(results.values()) else 1
+
+
 if __name__ == "__main__":
     import argparse
     pv.global_theme.allow_empty_mesh = True
@@ -7710,7 +7730,11 @@ if __name__ == "__main__":
     parser.add_argument("cube_files", nargs='*',
                         help="Optional .cube files to load on startup. "
                              "More files can be dragged onto the window at any time.")
+    parser.add_argument("--self-check", action="store_true",
+                        help="Report whether the C++ extensions load, then exit.")
     args = parser.parse_args()
+    if args.self_check:
+        sys.exit(_self_check())
     valid = [f for f in args.cube_files if os.path.isfile(f)]
     if args.cube_files and not valid:
         print("No valid cube files found among the arguments provided.")
