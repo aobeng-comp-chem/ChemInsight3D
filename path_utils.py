@@ -106,7 +106,7 @@ def remember_dir(path: str) -> None:
 
 
 def normalize_path_for_runtime(path: str) -> str:
-    """Return a path string that will be accessible from the current runtime.
+    r"""Return a path string that will be accessible from the current runtime.
 
     - On WSL: converts Windows-style drive paths (C:\...) to `/mnt/c/...`.
     - On Windows: converts `/mnt/c/...` back to `C:\...`.

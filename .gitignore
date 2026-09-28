@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.so
+*.pyd
 *.o
 *.exe
 *.dll
@@ -102,4 +103,4 @@ tests/tmp_*.py
 .codex
 commit.sh
 pyproject.toml
-
+chemview-linux.tar.gz

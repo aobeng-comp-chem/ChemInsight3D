@@ -192,9 +192,10 @@ py::array_t<double> electron_density(
     py::array_t<double> result(n_points);
     auto res = result.mutable_unchecked<1>();
 
-    // Parallelize over grid points
+    // Parallelize over grid points. The loop index is signed because MSVC's
+    // OpenMP requires it.
     #pragma omp parallel for schedule(dynamic, 64)
-    for (size_t ipt = 0; ipt < n_points; ++ipt) {
+    for (py::ssize_t ipt = 0; ipt < static_cast<py::ssize_t>(n_points); ++ipt) {
         double px = pts(ipt, 0);
         double py_ = pts(ipt, 1);
         double pz = pts(ipt, 2);
@@ -277,8 +278,9 @@ py::tuple occupied_density(
         std::vector<double> psi_alpha(n_occ_alpha);
         std::vector<double> psi_beta(n_occ_beta);
 
+        // Signed loop index: MSVC's OpenMP requires it.
         #pragma omp for schedule(dynamic, 64)
-        for (size_t ipt = 0; ipt < n_points; ++ipt) {
+        for (py::ssize_t ipt = 0; ipt < static_cast<py::ssize_t>(n_points); ++ipt) {
             double px = pts(ipt, 0);
             double py_ = pts(ipt, 1);
             double pz = pts(ipt, 2);
