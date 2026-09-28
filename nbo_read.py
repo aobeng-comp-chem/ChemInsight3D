@@ -919,7 +919,7 @@ def get_ao_overlap_matrix(basis_filepath):
     (load_basis_headless()'s final_norm_basis), computed once per file and
     cached -- this is the same (nbas, nbas) integral evaluation that both
     localization (localization_io.get_localization_inputs) and population
-    analysis (chemview._load_overlap_for_details) need, so callers should
+    analysis (ChemInsight3D._load_overlap_for_details) need, so callers should
     go through here instead of recomputing it themselves.
     """
     cache_key = _file_cache_key(basis_filepath)

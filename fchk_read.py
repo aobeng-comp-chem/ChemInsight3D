@@ -3,7 +3,7 @@ fchk_read.py
 ============
 Reads a Gaussian formatted checkpoint (.fchk) file and exposes the same
 interface that nbo_read.py provides for .47/.31 files, so that
-chemview.py can call it uniformly.
+ChemInsight3D.py can call it uniformly.
 
 Public API (mirrors nbo_read equivalents)
 ------------------------------------------
@@ -605,7 +605,7 @@ def compute_cube_data_fchk(fchk_path, orbital_indices, spin,
         with the supplied coefficients.
 
     Returns the same list-of-dicts format so _load_computed_cubes in
-    chemview.py can handle both sources identically.
+    ChemInsight3D.py can handle both sources identically.
     """
     if precomputed_basis is None:
         final_norm_basis, coordinates_ang, atom_info = load_basis_from_fchk(fchk_path)

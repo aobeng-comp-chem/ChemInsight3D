@@ -2,7 +2,7 @@
 molden_read.py
 ==============
 Reads a Molden (.molden) file and exposes the same interface as
-nbo_read.py and fchk_read.py so that chemview.py can call all three
+nbo_read.py and fchk_read.py so that ChemInsight3D.py can call all three
 sources uniformly.
 
 Supported Molden features
@@ -681,7 +681,7 @@ def compute_cube_data_molden(molden_path, orbital_indices, spin,
         localization_io.localize_orbitals). When given, the normal
         load_cmos_from_molden() call is skipped.
 
-    Returns the same list-of-dicts so _load_computed_cubes in chemview.py
+    Returns the same list-of-dicts so _load_computed_cubes in ChemInsight3D.py
     handles all three sources identically.
     """
     if precomputed_basis is None:

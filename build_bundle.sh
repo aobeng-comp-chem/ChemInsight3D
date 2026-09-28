@@ -9,7 +9,7 @@
 #   ./build_bundle.sh                       # uses python3
 #   PYTHON=~/anaconda3/bin/python ./build_bundle.sh
 #
-# Output: build_dist/chemview/chemview  (run it directly, or pass .cube files)
+# Output: build_dist/ChemInsight3D/ChemInsight3D  (run it directly, or pass .cube files)
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -48,11 +48,11 @@ for ext in overlap_matrix electron_density_opt_omp localization_native; do
 done
 
 echo "==> Running PyInstaller"
-rm -rf "$DIST/chemview"
+rm -rf "$DIST/ChemInsight3D"
 "$VENV/bin/python" -m PyInstaller \
     --noconfirm \
     --onedir \
-    --name chemview \
+    --name ChemInsight3D \
     --distpath "$DIST" \
     --workpath "$BUILD/pyinstaller" \
     --specpath "$BUILD" \
@@ -62,10 +62,10 @@ rm -rf "$DIST/chemview"
     --hidden-import localization_native \
     --exclude-module tkinter \
     --exclude-module pytest \
-    "$STAGE/chemview.py"
+    "$STAGE/ChemInsight3D.py"
 
 echo "==> Checking the C++ extensions load inside the bundle"
-"$DIST/chemview/chemview" --self-check
+"$DIST/ChemInsight3D/ChemInsight3D" --self-check
 
 echo
-echo "==> Done: $DIST/chemview/chemview ($(du -sh "$DIST/chemview" | cut -f1))"
+echo "==> Done: $DIST/ChemInsight3D/ChemInsight3D ($(du -sh "$DIST/ChemInsight3D" | cut -f1))"

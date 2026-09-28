@@ -6,7 +6,7 @@ ChemInsight3D is a Python program for visualizing molecular orbitals and electro
 
 | Module | Purpose |
 |---|---|
-| `chemview.py` | Viewer application (PyQt5 + PyVista) and program entry point |
+| `ChemInsight3D.py` | Viewer application (PyQt5 + PyVista) and program entry point |
 | `fchk_read.py`, `read_molden.py`, `nbo_read.py` | File readers. All three return the same basis, geometry and orbital data structures |
 | `localization_io.py` | Pipek–Mezey localization, Fock matrices and occupations |
 | `density_analysis.py` | Total, alpha, beta and spin density grids |
@@ -44,13 +44,20 @@ sudo apt install build-essential   # Ubuntu: installs the compiler
 python3 build_native_extensions.py
 ```
 
+On Windows the script uses the MSVC compiler, which it finds automatically. Install the Visual Studio Build Tools with the C++ workload first:
+
+```powershell
+winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+python build_native_extensions.py
+```
+
 Rebuild with the same Python interpreter you use to run the program. These environment variables change the build:
 
 - `CXX`: the compiler to use.
 - `NO_OPENMP=1`: build without OpenMP.
 - `NO_MARCH_NATIVE=1`: do not optimize for the CPU of this machine.
 
-To check that the extensions load, run `python3 chemview.py --self-check`.
+To check that the extensions load, run `python3 ChemInsight3D.py --self-check`.
 
 ## Standalone bundle
 
@@ -61,23 +68,32 @@ To check that the extensions load, run `python3 chemview.py --self-check`.
 PYTHON=~/anaconda3/bin/python ./build_bundle.sh # or choose the Python to build with
 ```
 
-The result is `build_dist/chemview/` (about 1.1 GB). Copy the whole folder to another machine and run:
+The result is `build_dist/ChemInsight3D/` (about 1.1 GB). Copy the whole folder to another machine and run:
 
 ```bash
-build_dist/chemview/chemview                 # open the viewer
-build_dist/chemview/chemview a.cube          # open cube files at startup
-build_dist/chemview/chemview --self-check    # check that the C++ extensions load
+build_dist/ChemInsight3D/ChemInsight3D               # open the viewer
+build_dist/ChemInsight3D/ChemInsight3D a.cube        # open cube files at startup
+build_dist/ChemInsight3D/ChemInsight3D --self-check  # check that the C++ extensions load
 ```
 
-The bundle runs on Linux x86-64 (including WSL) with a graphical desktop. A Windows or macOS bundle has to be built on that system.
+The bundle runs on Linux x86-64 (including WSL) with a graphical desktop.
+
+**Windows bundle:** `build_bundle.ps1` does the same on Windows. It needs Python 3.12 from python.org and the Visual Studio Build Tools (see above). Run it from PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File build_bundle.ps1        # build
+powershell -ExecutionPolicy Bypass -File build_bundle.ps1 -Zip   # build and zip
+```
+
+The result is `%LOCALAPPDATA%\ChemInsight3D-build\dist\ChemInsight3D\ChemInsight3D.exe`, with `ChemInsight3D-windows.zip` beside it when `-Zip` is given. Copy the whole `ChemInsight3D` folder, or the zip, to another 64-bit Windows machine and run `ChemInsight3D.exe`. Use `-WorkDir` to build somewhere else.
 
 ## How to run
 
 **Viewer:**
 
 ```bash
-python3 chemview.py                 # open an empty window
-python3 chemview.py a.cube b.cube   # open cube files at startup
+python3 ChemInsight3D.py                 # open an empty window
+python3 ChemInsight3D.py a.cube b.cube   # open cube files at startup
 ```
 
 To compute orbitals from a wavefunction file, load the `.fchk`, `.molden` or `.47`/`.31` file from inside the program.
