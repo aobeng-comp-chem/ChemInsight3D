@@ -10,6 +10,7 @@
 # Usage (from PowerShell):
 #   powershell -ExecutionPolicy Bypass -File build_bundle.ps1
 #   powershell -ExecutionPolicy Bypass -File build_bundle.ps1 -Zip
+#   powershell -ExecutionPolicy Bypass -File build_bundle.ps1 -Python C:\path	o\python.exe
 #
 # The work is done in a local folder (default %LOCALAPPDATA%\ChemInsight3D-build)
 # because building from a \\wsl.localhost path is slow and unreliable.
@@ -17,6 +18,7 @@
 
 param(
     [string]$PythonVersion = "3.12",
+    [string]$Python = "",   # python.exe to build with; default: py -$PythonVersion
     [string]$WorkDir = "$env:LOCALAPPDATA\ChemInsight3D-build",
     [switch]$Zip
 )
@@ -43,7 +45,11 @@ $env:PYTHONNOUSERSITE = "1"   # ignore packages in the user site folder
 
 Write-Host "==> Build environment (Python $PythonVersion)"
 if (-not (Test-Path $VenvPython)) {
-    Invoke-Checked "py" @("-$PythonVersion", "-m", "venv", $Venv)
+    if ($Python) {
+        Invoke-Checked $Python @("-m", "venv", $Venv)
+    } else {
+        Invoke-Checked "py" @("-$PythonVersion", "-m", "venv", $Venv)
+    }
 }
 Invoke-Checked $VenvPython @("-m", "pip", "install", "-q", "--upgrade", "pip")
 Invoke-Checked $VenvPython (@("-m", "pip", "install", "-q", "-r", (Join-Path $Repo "requirements.txt")) + $BuildTools)
