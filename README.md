@@ -2,6 +2,21 @@
 
 ChemInsight3D is a Python program for visualizing molecular orbitals and electron density in 3D. It reads wavefunctions from Gaussian (`.fchk`/`.fck`), Molden (`.molden`) and NBO (`.47`/`.31` with a key file) output. From them it computes orbital and density grids (cube data), localizes orbitals with the Pipek–Mezey method, and displays the results. It also opens existing `.cube` files.
 
+## Download
+
+Ready-to-run bundles are attached to each [release](https://github.com/aobeng-comp-chem/ChemInsight3D/releases). They contain their own Python and every package, so nothing else needs to be installed.
+
+**Windows (64-bit):** download `ChemInsight3D-windows.zip`, unzip it, and run `ChemInsight3D\ChemInsight3D.exe`.
+
+**Linux x86-64 (including WSL):** download `ChemInsight3D-linux-x86_64.tar.gz` and extract it on Linux with `tar`:
+
+```bash
+tar xzf ChemInsight3D-linux-x86_64.tar.gz -C ~
+~/ChemInsight3D/ChemInsight3D
+```
+
+Do not extract the Linux archive with a Windows tool (Explorer, 7-Zip, WinRAR), even when you plan to run it from WSL. The bundle contains symbolic links, which Windows tools save as small text files. The program then stops at startup with an error such as `libicui18n.so.56: file too short`. From WSL, extract it onto the Linux file system (for example `~`) rather than `/mnt/c`; it also starts faster there.
+
 ## Code overview
 
 | Module | Purpose |
@@ -76,7 +91,7 @@ build_dist/ChemInsight3D/ChemInsight3D a.cube        # open cube files at startu
 build_dist/ChemInsight3D/ChemInsight3D --self-check  # check that the C++ extensions load
 ```
 
-The bundle runs on Linux x86-64 (including WSL) with a graphical desktop.
+The bundle runs on Linux x86-64 (including WSL) with a graphical desktop. It contains symbolic links, so copy it with Linux tools (`cp -a`, `rsync -a`, or a `tar` archive), not through Windows.
 
 **Windows bundle:** `build_bundle.ps1` does the same on Windows. It needs Python 3.12 from python.org and the Visual Studio Build Tools (see above). Run it from PowerShell:
 
