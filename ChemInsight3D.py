@@ -93,17 +93,17 @@ class _DialogCenterFilter(QObject):
 # Each entry: (display_name, pos_rgb_0_1, neg_rgb_0_1)
 # First entry is the default.
 LOBE_COLOR_SCHEMES = {
-    "Mathematica (default)": ((0.60, 0.15, 0.18), (0.55, 0.72, 0.82)),   # crimson / steel-blue
-    "Red / Blue":            ((0.85, 0.10, 0.10), (0.10, 0.30, 0.85)),   # classic CPK-style
-    "Red / Green":           ((0.85, 0.12, 0.12), (0.12, 0.70, 0.25)),   # common in textbooks
-    "Orange / Teal":         ((0.92, 0.50, 0.05), (0.05, 0.60, 0.65)),   # high-contrast warm/cool
-    "Purple / Gold":         ((0.55, 0.10, 0.75), (0.85, 0.72, 0.05)),   # vivid complementary
-    "White / Grey":          ((0.95, 0.95, 0.95), (0.45, 0.45, 0.45)),   # monochrome / print
+    "Crimson / Steel-blue (default)": ((0.60, 0.15, 0.18), (0.55, 0.72, 0.82)),   # crimson / steel-blue
+    "Red / Blue":                     ((0.85, 0.10, 0.10), (0.10, 0.30, 0.85)),   # classic CPK-style
+    "Red / Green":                    ((0.85, 0.12, 0.12), (0.12, 0.70, 0.25)),   # common in textbooks
+    "Orange / Teal":                  ((0.92, 0.50, 0.05), (0.05, 0.60, 0.65)),   # high-contrast warm/cool
+    "Purple / Gold":                  ((0.55, 0.10, 0.75), (0.85, 0.72, 0.05)),   # vivid complementary
+    "White / Grey":                   ((0.95, 0.95, 0.95), (0.45, 0.45, 0.45)),   # monochrome / print
 }
 
 # Active colours — initialised to the default, updated by the combo box
-LOBE_POS_COLOR = LOBE_COLOR_SCHEMES["Mathematica (default)"][0]
-LOBE_NEG_COLOR = LOBE_COLOR_SCHEMES["Mathematica (default)"][1]
+LOBE_POS_COLOR = LOBE_COLOR_SCHEMES["Crimson / Steel-blue (default)"][0]
+LOBE_NEG_COLOR = LOBE_COLOR_SCHEMES["Crimson / Steel-blue (default)"][1]
 
 GRID_LINES_U = 18
 GRID_LINES_V = 12
@@ -4238,8 +4238,8 @@ class MultiCubeVisualizer:
         self.show_population_info = False
         self.background_color  = 'black'
 
-        self.lobe_pos_color  = LOBE_COLOR_SCHEMES["Mathematica (default)"][0]
-        self.lobe_neg_color  = LOBE_COLOR_SCHEMES["Mathematica (default)"][1]
+        self.lobe_pos_color  = LOBE_COLOR_SCHEMES["Crimson / Steel-blue (default)"][0]
+        self.lobe_neg_color  = LOBE_COLOR_SCHEMES["Crimson / Steel-blue (default)"][1]
         self.color_scheme_combo = None
 
         self.pos_actor       = None
@@ -6514,7 +6514,7 @@ class MultiCubeVisualizer:
             'show_labels':     self.show_atom_labels,
             'ssao':            self.ssao_enabled,
             'color_scheme':    self.color_scheme_combo.currentText()
-                               if self.color_scheme_combo else 'Mathematica (default)',
+                               if self.color_scheme_combo else 'Crimson / Steel-blue (default)',
             'camera': {
                 'position':  list(cam.GetPosition()),
                 'focal':     list(cam.GetFocalPoint()),
@@ -6567,7 +6567,9 @@ class MultiCubeVisualizer:
         self.show_atom_labels = state.get('show_labels', False)
         self.ssao_enabled = state.get('ssao', False)
 
-        scheme = state.get('color_scheme', 'Mathematica (default)')
+        scheme = state.get('color_scheme', 'Crimson / Steel-blue (default)')
+        if scheme == 'Mathematica (default)':   # name used by older sessions
+            scheme = 'Crimson / Steel-blue (default)'
         if scheme in LOBE_COLOR_SCHEMES:
             self.lobe_pos_color, self.lobe_neg_color = LOBE_COLOR_SCHEMES[scheme]
             if self.color_scheme_combo:
