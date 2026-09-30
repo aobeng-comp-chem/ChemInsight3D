@@ -15,7 +15,7 @@ tar xzf ChemInsight3D-linux-x86_64.tar.gz -C ~
 ~/ChemInsight3D/ChemInsight3D
 ```
 
-Do not extract the Linux archive with a Windows tool (Explorer, 7-Zip, WinRAR), even when you plan to run it from WSL. The bundle contains symbolic links, which Windows tools save as small text files. The program then stops at startup with an error such as `libicui18n.so.56: file too short`. From WSL, extract it onto the Linux file system (for example `~`) rather than `/mnt/c`; it also starts faster there.
+Do not extract the Linux archive with a Windows tool (Explorer, 7-Zip, WinRAR), even when you plan to run it from WSL. From WSL, extract it onto the Linux file system (for example `~`) rather than `/mnt/c`; it also starts faster there.
 
 ## Code overview
 
