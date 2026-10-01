@@ -144,3 +144,15 @@ The Fe(CO)₅ regression tests in `tests/test_feco5_regression.py` read these fi
 - `test_files/closed-shell/cfour/MOLDEN_new.molden`
 - `test_files/closed-shell/cfour/MOLDEN.47`
 - `test_files/closed-shell/cfour/MOLDEN.40`
+
+## Author
+
+ChemInsight3D is written and maintained by **Augustine Obeng** ([@aobeng-comp-chem](https://github.com/aobeng-comp-chem)).
+
+For questions, bug reports or suggestions, open an [issue](https://github.com/aobeng-comp-chem/ChemInsight3D/issues) or email aobeng370@gmail.com.
+
+## License
+
+Copyright (C) 2026 Augustine Obeng
+
+ChemInsight3D is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License, version 3 or (at your option) any later version. It is distributed in the hope that it will be useful, but without any warranty. See [LICENSE](LICENSE) for the full terms.
