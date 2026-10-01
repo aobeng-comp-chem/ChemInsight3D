@@ -147,7 +147,7 @@ The Fe(CO)₅ regression tests in `tests/test_feco5_regression.py` read these fi
 
 ## Author
 
-ChemInsight3D is written and maintained by **Augustine Obeng** ([@aobeng-comp-chem](https://github.com/aobeng-comp-chem)).
+ChemInsight3D is written and maintained by **Augustine Obeng** ([@aobeng-comp-chem](https://github.com/aobeng-comp-chem)), Department of Chemistry, University at Buffalo, The State University of New York. ORCID: [0009-0005-6794-2259](https://orcid.org/0009-0005-6794-2259).
 
 For questions, bug reports or suggestions, open an [issue](https://github.com/aobeng-comp-chem/ChemInsight3D/issues) or email aobeng370@gmail.com.
 
