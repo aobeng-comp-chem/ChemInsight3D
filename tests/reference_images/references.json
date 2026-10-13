@@ -1,0 +1,25 @@
+{
+  "fingerprint": "Linux|vtk 9.6.0|libGLX_mesa,libd3d12,libd3d12core,swrast_dri",
+  "images": {
+    "water_opacity100": [
+      600,
+      800,
+      3
+    ],
+    "water_opacity050": [
+      600,
+      800,
+      3
+    ],
+    "feco5_opacity100": [
+      600,
+      800,
+      3
+    ],
+    "feco5_opacity050": [
+      600,
+      800,
+      3
+    ]
+  }
+}

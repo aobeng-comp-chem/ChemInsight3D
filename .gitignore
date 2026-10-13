@@ -104,3 +104,4 @@ tests/tmp_*.py
 commit.sh
 pyproject.toml
 chemview-linux.tar.gz
+chatgpt_review/

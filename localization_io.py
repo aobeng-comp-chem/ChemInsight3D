@@ -17,8 +17,14 @@ localization once it has them.
                        space='occupied'|'virtual'|'range'|'occupied_valence', ...)
         -> (localized_cmo, loc_energy)
 
+    localize_source(path, spin='alpha', space='occupied', ...)
+        -> dict of localized orbitals (no grids), cached per file and options
+
+    compute_localized_cubes(localized, numbers, grid_quality, ...)
+        -> cube grids for the chosen localized orbitals only
+
     compute_localized_cube_data(path, spin='alpha', space='occupied', ...)
-        -> dict of localized cube-grid data, ready for a viewer
+        -> localize_source() plus cubes for every localized orbital
 """
 
 import os
@@ -1146,7 +1152,8 @@ def _localized_occupations(space, n_sel, is_open_shell):
 
 def _compute_source_cubes(source_type, path, final_basis, coordinates_ang,
                           atom_info, orbital_indices, cmos_rows, spin,
-                          grid_quality, ext_dist, bohr_const):
+                          grid_quality, ext_dist, bohr_const,
+                          progress_callback=None):
     """Dispatch cube generation to the reader that owns this source format."""
     if source_type == "nbo":
         import nbo_read as _nr
@@ -1155,6 +1162,7 @@ def _compute_source_cubes(source_type, path, final_basis, coordinates_ang,
             orbital_indices, path, spin,
             grid_quality, ext_dist, bohr_const,
             precomputed_cmos=cmos_rows,
+            progress_callback=progress_callback,
         )
     if source_type == "fchk":
         import fchk_read as _fr
@@ -1162,32 +1170,63 @@ def _compute_source_cubes(source_type, path, final_basis, coordinates_ang,
             path, orbital_indices, spin, grid_quality, ext_dist, bohr_const,
             precomputed_cmos=cmos_rows,
             precomputed_basis=(final_basis, coordinates_ang, atom_info),
+            progress_callback=progress_callback,
         )
     import read_molden as _mr
     return _mr.compute_cube_data_molden(
         path, orbital_indices, spin, grid_quality, ext_dist, bohr_const,
         precomputed_cmos=cmos_rows,
         precomputed_basis=(final_basis, coordinates_ang, atom_info),
+        progress_callback=progress_callback,
     )
 
 
-def compute_localized_cube_data(
-    path,
-    spin="alpha",
-    space="occupied",
-    n_occ=None,
-    orbital_range=None,
-    seed=0,
-    core_threshold=0.98,
-    grid_quality=75,
-    ext_dist=4.0,
-    bohr_const=0.529177249,
-):
+def localized_label_base(path, space):
     """
-    Localize a subspace of MOs and compute cube grids for them, ready for
-    a viewer to render -- the single entry point tying together
-    get_localization_inputs / get_fock_matrix / localize_orbitals and the
-    per-format compute_cube_data* functions.
+    "<base>_LOC_<space>": localized cubes are labeled "<label_base>-<n>". No
+    '.' before LOC -- os.path.splitext() is used elsewhere to recover <base>,
+    and a '.' there would be misparsed as a file extension.
+    """
+    return f"{os.path.splitext(os.path.basename(path))[0]}_LOC_{space}"
+
+
+def orbital_centres(populations, min_fraction=0.1, max_atoms=3):
+    """
+    Where each localized orbital lives: for each column of `populations`
+    (natom x norb, see atomic_populations), the atoms holding at least
+    `min_fraction` of it, largest first and at most `max_atoms`, as
+    [(atom_index_0_based, fraction), ...]. The largest atom is always
+    included, so every orbital gets at least one entry.
+    """
+    pops = np.asarray(populations, dtype=float)
+    centres = []
+    for column in pops.T:
+        order = np.argsort(-column)
+        picked = [(int(a), float(column[a])) for a in order[:max_atoms]
+                  if column[a] >= min_fraction]
+        centres.append(picked or [(int(order[0]), float(column[order[0]]))])
+    return centres
+
+
+# Recent localizations, so reopening the localized-orbital picker with the
+# same options does not localize again. Keyed by the source file(s)' path,
+# size and mtime plus every localization option; a few entries at most, since
+# each holds an nbas x n_selected coefficient matrix and the AO matrices.
+_LOCALIZATION_CACHE = {}
+_LOCALIZATION_CACHE_SIZE = 4
+
+
+def _file_stamp(path):
+    st = os.stat(path)
+    return (os.path.realpath(path), st.st_size, st.st_mtime_ns)
+
+
+def localize_source(path, spin="alpha", space="occupied", n_occ=None,
+                    orbital_range=None, seed=0, core_threshold=0.98):
+    """
+    Localize a subspace of a source file's MOs, without computing any grids.
+    The result goes to compute_localized_cubes() for just the orbitals a user
+    picks, so a 200-orbital localization doesn't build 200 grids.
 
     Localization prefers the native (C++) implementation and transparently
     falls back to the pure-Python localize_orbitals if the extension isn't
@@ -1202,37 +1241,49 @@ def compute_localized_cube_data(
     fchk/molden sources localize whatever CMOs are in the source file
     itself.
 
+    Results are cached per source file and options (_LOCALIZATION_CACHE);
+    a changed file is localized again.
+
     Parameters
     ----------
     path, spin, space, n_occ, orbital_range, seed, core_threshold : see
         localize_orbitals / get_localization_inputs. space='occupied_valence'
-        auto-splits the occupied space (per core_threshold) and produces
-        cubes for the outer/valence orbitals only -- inner/core orbitals
-        are left untouched and are not part of the returned cubes at all.
-    grid_quality, ext_dist, bohr_const : see compute_cube_data /
-        compute_cube_data_fchk / compute_cube_data_molden.
+        auto-splits the occupied space (per core_threshold) and localizes the
+        outer/valence orbitals only -- inner/core orbitals are left untouched
+        and are not part of the result at all.
 
     Returns
     -------
     dict with keys:
-        cubes           : list of per-orbital cube-grid dicts (same shape
-                           compute_cube_data* returns), labeled
-                           "<base>_LOC_<space>-<n>" (no '.' before LOC --
-                           os.path.splitext() is used elsewhere to recover
-                           <base>, and a '.' there would be misparsed as a
-                           file extension).
+        source_type, path, spin, space : echoed back / resolved.
+        label_base      : see localized_label_base().
         final_basis     : basis-function list.
+        coordinates_ang : atom coordinates, as the source's basis loader gives them.
         atom_info       : list of (Z, x_ang, y_ang, z_ang).
-        localized_cmo   : (nbas, n_selected) ndarray, AO x MO.
+        localized_cmo   : (nbas, n_selected) ndarray, AO x MO, sorted by energy.
         energies        : (n_selected,) ndarray, Fock expectation values.
         occupations     : (n_selected,) ndarray, or None for space='range'
                            (ambiguous when the range straddles n_occ).
+        centres         : per orbital, [(atom_index_0_based, fraction), ...]
+                           (see orbital_centres).
         overlap, fock   : AO-basis matrices used for the localization.
         orbital_indices : list(range(1, n_selected + 1)).
         n_occ           : the n_occ actually used (resolved if it was None).
-        space           : echoed back, for convenience.
+        seed            : echoed back.
     """
     source_type = _recognize_source_type(path)
+    stamps = [_file_stamp(path)]
+    if source_type == "nbo":
+        key_file = os.path.splitext(path)[0] + ".40"
+        if os.path.exists(key_file):
+            stamps.append(_file_stamp(key_file))
+    cache_key = (tuple(stamps), spin, space, n_occ,
+                 tuple(orbital_range) if orbital_range is not None else None,
+                 seed, core_threshold)
+    cached = _LOCALIZATION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     key_path, final_basis, coordinates_ang, atom_info = _load_source_basis(
         path, source_type)
 
@@ -1256,36 +1307,97 @@ def compute_localized_cube_data(
         ordered_cmo, ordered_overlap, ordered_fock, basis_center,
         space, n_occ, orbital_range, seed, core_threshold=core_threshold,
     )
+    # Atom populations in the center-ordered basis: basis_center lists the
+    # centers in ascending CENTER order, and CENTER is the 1-based atom number.
+    populations = atomic_populations(localized_cmo, ordered_overlap, basis_center)
+    centre_numbers = sorted({int(bf["CENTER"]) for bf in ordered_basis})
+    centres = [[(centre_numbers[a] - 1, f) for a, f in per_orbital]
+               for per_orbital in orbital_centres(populations)]
     if inverse_perm is not None:
         localized_cmo = localized_cmo[inverse_perm, :]
 
     n_sel = localized_cmo.shape[1]
-    orbital_indices = list(range(1, n_sel + 1))
-    cmos_rows = list(localized_cmo.T)
-
-    occupations = _localized_occupations(space, n_sel, is_open_shell)
-
-    cubes = _compute_source_cubes(
-        source_type, path, final_basis, coordinates_ang, atom_info,
-        orbital_indices, cmos_rows, spin, grid_quality, ext_dist, bohr_const)
-
-    base = os.path.splitext(os.path.basename(path))[0]
-    for i, cube in enumerate(cubes, start=1):
-        cube["label"] = f"{base}_LOC_{space}-{i}"
-
-    return {
-        "cubes": cubes,
+    result = {
+        "source_type": source_type,
+        "path": path,
+        "spin": spin,
+        "space": space,
+        "label_base": localized_label_base(path, space),
         "final_basis": final_basis,
+        "coordinates_ang": coordinates_ang,
         "atom_info": atom_info,
         "localized_cmo": localized_cmo,
         "energies": loc_energy,
-        "occupations": occupations,
+        "occupations": _localized_occupations(space, n_sel, is_open_shell),
+        "centres": centres,
         "overlap": overlap,
         "fock": fock,
-        "orbital_indices": orbital_indices,
+        "orbital_indices": list(range(1, n_sel + 1)),
         "n_occ": n_occ,
-        "space": space,
+        "seed": seed,
     }
+    _LOCALIZATION_CACHE[cache_key] = result
+    while len(_LOCALIZATION_CACHE) > _LOCALIZATION_CACHE_SIZE:
+        _LOCALIZATION_CACHE.pop(next(iter(_LOCALIZATION_CACHE)))
+    return result
+
+
+def compute_localized_cubes(localized, numbers, grid_quality=75, ext_dist=4.0,
+                            bohr_const=0.529177249, progress_callback=None):
+    """
+    Cube grids for the chosen localized orbitals of a localize_source()
+    result. `numbers` are 1-based positions in that result (its
+    orbital_indices); cubes come back in the order given, labeled
+    "<label_base>-<n>" so a cube keeps its number whatever else was picked.
+
+    progress_callback : optional callable(done, total), called as each cube
+        grid finishes (see grid_utils.evaluate_orbital_grids).
+    """
+    n_sel = localized["localized_cmo"].shape[1]
+    numbers = [int(n) for n in numbers]
+    bad = [n for n in numbers if not 1 <= n <= n_sel]
+    if bad:
+        raise ValueError(f"Localized orbital number(s) {bad} out of range 1-{n_sel}.")
+    cmos_rows = [localized["localized_cmo"][:, n - 1] for n in numbers]
+    cubes = _compute_source_cubes(
+        localized["source_type"], localized["path"], localized["final_basis"],
+        localized["coordinates_ang"], localized["atom_info"],
+        numbers, cmos_rows, localized["spin"], grid_quality, ext_dist, bohr_const,
+        progress_callback=progress_callback)
+    for n, cube in zip(numbers, cubes):
+        cube["label"] = f"{localized['label_base']}-{n}"
+    return cubes
+
+
+def compute_localized_cube_data(
+    path,
+    spin="alpha",
+    space="occupied",
+    n_occ=None,
+    orbital_range=None,
+    seed=0,
+    core_threshold=0.98,
+    grid_quality=75,
+    ext_dist=4.0,
+    bohr_const=0.529177249,
+    progress_callback=None,
+):
+    """
+    Localize a subspace of MOs and compute cube grids for every localized
+    orbital: localize_source() followed by compute_localized_cubes() for all
+    of them. The viewer picks a subset instead; this stays for scripts.
+
+    Returns the localize_source() dict plus 'cubes' (one per localized
+    orbital, labeled "<base>_LOC_<space>-<n>").
+    """
+    localized = localize_source(path, spin=spin, space=space, n_occ=n_occ,
+                                orbital_range=orbital_range, seed=seed,
+                                core_threshold=core_threshold)
+    cubes = compute_localized_cubes(localized, localized["orbital_indices"],
+                                    grid_quality=grid_quality, ext_dist=ext_dist,
+                                    bohr_const=bohr_const,
+                                    progress_callback=progress_callback)
+    return {**localized, "cubes": cubes}
 
 
 

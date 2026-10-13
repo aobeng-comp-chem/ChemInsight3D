@@ -590,7 +590,8 @@ def _load_cmo_matrix_fchk(fchk_path, spin="alpha"):
 
 def compute_cube_data_fchk(fchk_path, orbital_indices, spin,
                             grid_quality, ext_dist, bohr_const,
-                            precomputed_cmos=None, precomputed_basis=None):
+                            precomputed_cmos=None, precomputed_basis=None,
+                            progress_callback=None):
     """
     Compute orbital grids directly from a .fchk file.
 
@@ -603,6 +604,9 @@ def compute_cube_data_fchk(fchk_path, orbital_indices, spin,
         load_cmos_from_fchk() call -- and its "all orbitals -> energy
         order" reindexing -- is skipped, so orbital_indices stays aligned
         with the supplied coefficients.
+
+    progress_callback : optional callable(done, total), see
+        grid_utils.evaluate_orbital_grids.
 
     Returns the same list-of-dicts format so _load_computed_cubes in
     ChemInsight3D.py can handle both sources identically.
@@ -622,7 +626,8 @@ def compute_cube_data_fchk(fchk_path, orbital_indices, spin,
     return evaluate_orbital_grids(
         final_norm_basis, coordinates_ang, atom_info, cmos, orbital_indices,
         os.path.splitext(os.path.basename(fchk_path))[0],
-        grid_quality, ext_dist, bohr_const)
+        grid_quality, ext_dist, bohr_const,
+        progress_callback=progress_callback)
 
 def _sort_basis_by_shell_label_order(basis):
     """

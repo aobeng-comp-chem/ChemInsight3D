@@ -1345,7 +1345,7 @@ def _write_cube_headless(filepath, grid_data, atom_info,
 def compute_cube_data(final_norm_basis, coordinates_ang, atom_info,
                       orbital_indices, key_filepath, spin,
                       grid_quality, ext_dist, bohr_const,
-                      precomputed_cmos=None):
+                      precomputed_cmos=None, progress_callback=None):
     """
     Compute orbital grids for the requested orbitals from a pre-loaded basis.
     Returns in-memory data only — no files are written here.
@@ -1366,6 +1366,8 @@ def compute_cube_data(final_norm_basis, coordinates_ang, atom_info,
     grid_quality       : 50 / 75 / 100 / 125  (max grid points on widest axis)
     ext_dist           : float bohr extension past molecular bounds
     bohr_const         : Angstrom-per-bohr constant
+    progress_callback  : optional callable(done, total), see
+                          grid_utils.evaluate_orbital_grids.
 
     Returns
     -------
@@ -1384,7 +1386,8 @@ def compute_cube_data(final_norm_basis, coordinates_ang, atom_info,
     return evaluate_orbital_grids(
         final_norm_basis, coordinates_ang, atom_info, cmos, orbital_indices,
         os.path.basename(os.path.splitext(key_filepath)[0]),
-        grid_quality, ext_dist, bohr_const)
+        grid_quality, ext_dist, bohr_const,
+        progress_callback=progress_callback)
 
 
 def write_cube_from_result(result_dict, filepath):

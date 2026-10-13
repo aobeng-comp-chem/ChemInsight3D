@@ -104,15 +104,40 @@ def _orbital_evaluator(basis, coord_bohr, points, shape):
     return evaluate, "Python (NumPy)"
 
 
+def estimate_remaining_seconds(done, total, started, last_done_at, now):
+    """
+    Estimated seconds left in a run of *total* cubes, or None before the first
+    cube has finished.
+
+    The average time per cube is the actual elapsed time up to the latest
+    completion divided by the cubes completed so far, so the estimate adapts
+    whenever cube times vary. Between completions the estimate counts down
+    from that point, and it never drops below zero when a cube runs longer
+    than average. All times are time.monotonic() values.
+    """
+    if done <= 0:
+        return None
+    if done >= total:
+        return 0.0
+    average = (last_done_at - started) / done
+    return max(0.0, average * (total - done) - (now - last_done_at))
+
+
 def evaluate_orbital_grids(basis, coordinates_ang, atom_info, cmos,
                            orbital_indices, label_base,
-                           grid_quality, ext_dist, bohr_const):
+                           grid_quality, ext_dist, bohr_const,
+                           progress_callback=None):
     """
     Evaluate one cube grid per supplied MO coefficient vector.
 
     This is the body that nbo_read.compute_cube_data, fchk_read's and
     read_molden's equivalents all shared verbatim; they now differ only in how
     they obtain *basis* and *cmos*.
+
+    progress_callback : optional callable(done, total). It is called with
+        done=0 just before the first cube starts, then after each finished
+        cube. It runs in the caller's thread, so a GUI must forward it through
+        a thread-safe mechanism (e.g. a Qt signal).
 
     Returns
     -------
@@ -132,6 +157,9 @@ def evaluate_orbital_grids(basis, coordinates_ang, atom_info, cmos,
     evaluate, engine_name = _orbital_evaluator(basis, coord_bohr, points, shape)
 
     results = []
+    total = len(orbital_indices)
+    if progress_callback is not None:
+        progress_callback(0, total)
     started = time.time()
     for cmo, idx in zip(cmos, orbital_indices):
         results.append({
@@ -144,6 +172,8 @@ def evaluate_orbital_grids(basis, coordinates_ang, atom_info, cmos,
             'atom_info':  atom_info,
             'bohr_const': bohr_const,
         })
+        if progress_callback is not None:
+            progress_callback(len(results), total)
     print(f"[{engine_name}] total grid generation: {time.time() - started:.3f}s "
           f"for {len(orbital_indices)} orbital(s)")
     return results

@@ -4,23 +4,29 @@ import vtk
 import os
 import math
 import json
+import dataclasses
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 from itertools import combinations
 from path_utils import default_dir as _default_dir, remember_dir as _remember_dir, normalize_path_for_runtime as _normalize_path
+from contextlib import contextmanager
+import camera_utils
+import appearance
+import cube_store
+import rendering_style
+import offscreen_export
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QComboBox, QSlider, QCheckBox, QPushButton, QLabel,
     QDockWidget, QLineEdit, QFileDialog, QListWidget, QListWidgetItem,
     QMessageBox, QButtonGroup, QRadioButton, QGroupBox, QFrame, QSpinBox,
     QDialog, QDialogButtonBox, QDoubleSpinBox, QGridLayout, QToolBar,
-    QScrollArea, QSizePolicy, QStackedWidget, QAction, QMenu,
-    QProgressDialog, QAbstractItemView, QColorDialog, QSplitter,
+    QScrollArea, QSizePolicy, QStackedWidget, QAction, QMenu, QToolButton,
+    QProgressDialog, QProgressBar, QAbstractItemView, QColorDialog, QSplitter,
     QTableWidget, QTableWidgetItem, QTabWidget, QHeaderView, QPlainTextEdit,
 )
-from PyQt5.QtCore import Qt, QTimer, QSize, QPropertyAnimation, QEasingCurve, QRect, QThread, pyqtSignal, QEvent, QObject
-from PyQt5.QtGui import QDoubleValidator, QColor, QBrush, QFont
+from PyQt5.QtCore import Qt, QTimer, QSize, QPropertyAnimation, QEasingCurve, QRect, QThread, pyqtSignal, QEvent, QObject, QSignalBlocker
+from PyQt5.QtGui import QDoubleValidator, QColor, QBrush, QFont, QPixmap, QPainter, QIcon
 import sys
 from pyvistaqt import QtInteractor
 import matplotlib.pyplot as plt
@@ -92,21 +98,39 @@ class _DialogCenterFilter(QObject):
 # ── Isosurface colour schemes ─────────────────────────────────────────────────
 # Each entry: (display_name, pos_rgb_0_1, neg_rgb_0_1)
 # First entry is the default.
-LOBE_COLOR_SCHEMES = {
-    "Crimson / Steel-blue (default)": ((0.60, 0.15, 0.18), (0.55, 0.72, 0.82)),   # crimson / steel-blue
-    "Red / Blue":                     ((0.85, 0.10, 0.10), (0.10, 0.30, 0.85)),   # classic CPK-style
-    "Red / Green":                    ((0.85, 0.12, 0.12), (0.12, 0.70, 0.25)),   # common in textbooks
-    "Orange / Teal":                  ((0.92, 0.50, 0.05), (0.05, 0.60, 0.65)),   # high-contrast warm/cool
-    "Purple / Gold":                  ((0.55, 0.10, 0.75), (0.85, 0.72, 0.05)),   # vivid complementary
-    "White / Grey":                   ((0.95, 0.95, 0.95), (0.45, 0.45, 0.45)),   # monochrome / print
-}
+def is_open_surface(mesh):
+    """True when a surface has boundary edges, e.g. a lobe cut by the cube grid's edge."""
+    if mesh is None or mesh.n_cells == 0:
+        return False
+    edges = mesh.extract_feature_edges(boundary_edges=True, feature_edges=False,
+                                       manifold_edges=False, non_manifold_edges=False)
+    return edges.n_cells > 0
 
-# Active colours — initialised to the default, updated by the combo box
-LOBE_POS_COLOR = LOBE_COLOR_SCHEMES["Crimson / Steel-blue (default)"][0]
-LOBE_NEG_COLOR = LOBE_COLOR_SCHEMES["Crimson / Steel-blue (default)"][1]
 
+def pad_grid_with_zeros(grid):
+    """The same cube grid with one extra layer of zero values on every side."""
+    nx, ny, nz = grid.dimensions
+    values = np.asarray(grid.point_data['values']).reshape((nx, ny, nz), order='F')
+    spacing = np.asarray(grid.spacing, dtype=float)
+    padded = pv.ImageData(dimensions=(nx + 2, ny + 2, nz + 2), spacing=tuple(spacing),
+                          origin=tuple(np.asarray(grid.origin, dtype=float) - spacing))
+    padded.point_data['values'] = np.pad(values, 1).flatten(order='F')
+    return padded
+
+
+# Lobe phase palettes live in appearance.PALETTES.
+LOBE_POS_COLOR = appearance.PALETTES_BY_ID[appearance.DEFAULT_PALETTE].positive
+LOBE_NEG_COLOR = appearance.PALETTES_BY_ID[appearance.DEFAULT_PALETTE].negative
+APPEARANCE_DEBOUNCE_MS = 50   # coalesce atom/bond mesh rebuilds while a slider is dragged
+LABEL_MARGIN_PX = 5           # gap between an atom's drawn sphere and its label
+
+# Mesh overlay on the lobes (the v1.0.0 style): GRID_LINES_U meridians around
+# the y axis and GRID_LINES_V - 1 parallels, near-black and translucent.
 GRID_LINES_U = 18
 GRID_LINES_V = 12
+MESH_LINE_COLOR = (0.08, 0.08, 0.08)
+MESH_LINE_WIDTH = 0.8
+MESH_LINE_OPACITY = 0.75
 
 # Molecular geometry is deliberately denser than the contour grid so atom
 # spheres and bond tubes remain visually round at close zoom.
@@ -192,9 +216,109 @@ def space_filling_radius(vdw, cov):
     return vdw
 
 
+# ── Molecule meshes ───────────────────────────────────────────────────────────
+
+_UNIT_SPHERE = None
+
+
+def _unit_sphere():
+    """
+    Unit sphere at ATOM_SPHERE_RESOLUTION as (points, normals, triangles),
+    built once. The normals are the ones smooth shading would compute.
+    """
+    global _UNIT_SPHERE
+    if _UNIT_SPHERE is None:
+        s = pv.Sphere(radius=1.0, theta_resolution=ATOM_SPHERE_RESOLUTION,
+                      phi_resolution=ATOM_SPHERE_RESOLUTION).compute_normals(cell_normals=False)
+        _UNIT_SPHERE = (np.asarray(s.points), np.asarray(s.point_data['Normals']),
+                        np.asarray(s.regular_faces))
+    return _UNIT_SPHERE
+
+
+def _sphere_mesh(centres, radii, colours):
+    """
+    All atom spheres as one PolyData: copies of the cached unit sphere,
+    scaled and moved with numpy, with normals and per-point 'colors'.
+    Building a pv.Sphere per atom and merging took ~2 s for 500 atoms.
+    """
+    pts, nrm, tri = _unit_sphere()
+    n, npts = len(centres), len(pts)
+    points = (pts[None] * radii[:, None, None] + centres[:, None, :]).reshape(-1, 3)
+    triangles = (tri[None] + (np.arange(n) * npts)[:, None, None]).reshape(-1, 3)
+    faces = np.hstack([np.full((len(triangles), 1), 3), triangles]).ravel()
+    mesh = pv.PolyData(points, faces=faces)
+    mesh.point_data['Normals'] = np.tile(nrm, (n, 1))
+    mesh.point_data.active_normals_name = 'Normals'
+    mesh.point_data['colors'] = np.repeat(colours, npts, axis=0)
+    return mesh
+
+
+_UNIT_TUBE = None
+
+
+def _unit_tube():
+    """
+    Capped unit cylinder (radius 1, from z=0 to z=1, BOND_TUBE_SIDES sides) as
+    (points, normals, triangles), built once. The normals are the tube
+    filter's own: flat on the caps, radial on the side.
+    """
+    global _UNIT_TUBE
+    if _UNIT_TUBE is None:
+        t = pv.Line((0, 0, 0), (0, 0, 1)).tube(radius=1.0, n_sides=BOND_TUBE_SIDES).triangulate()
+        _UNIT_TUBE = (np.asarray(t.points), np.asarray(t.point_data.active_normals),
+                      np.asarray(t.regular_faces))
+    return _UNIT_TUBE
+
+
+def _tube_mesh(starts, ends, radius, colours):
+    """
+    All bond segments as one PolyData: copies of the cached unit tube,
+    rotated, stretched and moved with numpy. Building a tube per segment and
+    merging took 444 ms for 137 bonds and 42 s for 2,623.
+    """
+    pts, nrm, tri = _unit_tube()
+    d = ends - starts
+    length = np.linalg.norm(d, axis=1)
+    z = d / length[:, None]
+    helper = np.where(np.abs(z[:, :1]) < 0.9, [[1.0, 0.0, 0.0]], [[0.0, 1.0, 0.0]])
+    x = np.cross(helper, z)
+    x /= np.linalg.norm(x, axis=1)[:, None]
+    y = np.cross(z, x)
+    n, npts = len(starts), len(pts)
+    points = (starts[:, None, :]
+              + (pts[None, :, 0:1] * radius) * x[:, None, :]
+              + (pts[None, :, 1:2] * radius) * y[:, None, :]
+              + (pts[None, :, 2:3] * length[:, None, None]) * z[:, None, :]).reshape(-1, 3)
+    normals = (nrm[None, :, 0:1] * x[:, None, :] + nrm[None, :, 1:2] * y[:, None, :]
+               + nrm[None, :, 2:3] * z[:, None, :]).reshape(-1, 3)
+    triangles = (tri[None] + (np.arange(n) * npts)[:, None, None]).reshape(-1, 3)
+    faces = np.hstack([np.full((len(triangles), 1), 3), triangles]).ravel()
+    mesh = pv.PolyData(points, faces=faces)
+    mesh.point_data['Normals'] = normals
+    mesh.point_data.active_normals_name = 'Normals'
+    mesh.point_data['colors'] = np.repeat(colours, npts, axis=0)
+    return mesh
+
+
+def _join_meshes(a, b):
+    """Two triangle meshes from _tube_mesh / _sphere_mesh as one, normals and colours kept."""
+    triangles = np.vstack([a.regular_faces, b.regular_faces + a.n_points])
+    faces = np.hstack([np.full((len(triangles), 1), 3), triangles]).ravel()
+    mesh = pv.PolyData(np.vstack([a.points, b.points]), faces=faces)
+    mesh.point_data['Normals'] = np.vstack([a.point_data['Normals'], b.point_data['Normals']])
+    mesh.point_data.active_normals_name = 'Normals'
+    mesh.point_data['colors'] = np.vstack([a.point_data['colors'], b.point_data['colors']])
+    return mesh
+
+
 # ── UV Grid Helper ────────────────────────────────────────────────────────────
 
 def build_uv_grid_lines(mesh, n_u=GRID_LINES_U, n_v=GRID_LINES_V):
+    """
+    The v1.0.0 mesh overlay: the lobe cut by n_u planes through its centre
+    that contain the y axis (meridians), and by n_v - 1 planes perpendicular
+    to y (parallels), spread over the middle 90 % of its height.
+    """
     if mesh is None or mesh.n_points == 0:
         return pv.PolyData()
     centre = np.array(mesh.center)
@@ -445,6 +569,10 @@ def _population_report_text(population):
         " " + "-" * 79,
         "",
     ]
+    fallback = population.get("basis_fallback")
+    if fallback:
+        lines[1:1] = [f" AO basis: {fallback['requested']} could not be used, "
+                      f"{fallback['problem']}."]
 
     for orb in population.get("orbitals", []):
         occ = orb.get("occupation")
@@ -581,14 +709,22 @@ def _orbital_contributions(electron_dist, atom_contribs, atom_symbols):
     return contribs, summary_parts
 
 
-def _population_analysis_data(c, s, basis, atom_info, fock=None, orb_occ=None, energies=None):
+def _population_analysis_data(c, s, basis, atom_info, fock=None, orb_occ=None, energies=None,
+                              indices=None):
     # Adapted from the provided population_analy algorithm.  Atom percentages
     # come from signed Mulliken-style qas values; negative atom populations are
     # clipped only when building the final percentage distribution.
+    #
+    # Column j of c is orbital indices[j] (default j + 1); orb_occ and energies
+    # are per column. Entries carry that index, so a subset of orbitals (e.g.
+    # localized orbitals 3 and 7) is still found by its own number.
     atom_angmom_ranges = _get_angmom_ranges(basis)
     atom_ranges = _build_basis_atom_ranges(basis)
     atom_symbols = _atom_symbol_map(atom_info)
     nloc = c.shape[1]
+    if indices is None:
+        indices = range(1, nloc + 1)
+    indices = [int(i) for i in indices]
 
     orb_energ = _population_orbital_energies(c, fock, energies, nloc)
     occ = _population_occupations(orb_occ, nloc)
@@ -597,8 +733,7 @@ def _population_analysis_data(c, s, basis, atom_info, fock=None, orb_occ=None, e
     orbitals = []
     atom_total_contrib = defaultdict(float)
 
-    for s_idx in range(1, nloc + 1):
-        col = s_idx - 1
+    for col, s_idx in enumerate(indices):
         atom_contribs, pairs = _atom_population_contribs(
             c, sc, col, atom_ranges, atom_angmom_ranges)
         electron_dist, total = _electron_distribution(pairs)
@@ -642,11 +777,31 @@ def _population_analysis_data(c, s, basis, atom_info, fock=None, orb_occ=None, e
     }
 
 
+def _per_orbital(values, orbital_indices):
+    """
+    Entries of a per-orbital array (or a density matrix's diagonal) for the
+    given 1-based orbital indices, NaN where missing; None stays None.
+    """
+    if values is None:
+        return None
+    arr = np.asarray(values, dtype=float)
+    if arr.ndim == 2:
+        arr = np.diag(arr)
+    return np.array([arr[i - 1] if 0 < i <= len(arr) else np.nan for i in orbital_indices])
+
+
 def _build_source_details(source_type, source_path, spin,
                           basis, atom_info, orbital_indices, cmos,
                           energies=None, occupations=None,
                           overlap=None, fock=None,
-                          context=None):
+                          context=None, precompute_population=True):
+    """
+    The source_details dict attached to computed cubes. energies and
+    occupations are indexed by orbital number (entry i - 1 is orbital i).
+    With an overlap matrix and precompute_population, the AO-basis population
+    analysis of these orbitals is included; otherwise it is computed when
+    population info is first shown (where NBO sources offer a choice of basis).
+    """
     basis_rows = _serialise_basis_functions(basis, atom_info)
     orbitals = []
     base = os.path.splitext(os.path.basename(source_path))[0]
@@ -666,16 +821,18 @@ def _build_source_details(source_type, source_path, spin,
         })
     population = None
     try:
-        if overlap is not None and cmos:
+        if precompute_population and overlap is not None and cmos:
             cmat = np.column_stack(cmos)
             population = _population_analysis_data(
-                cmat, overlap, basis, atom_info,
-                fock=fock, orb_occ=occupations, energies=energies
+                cmat, overlap, basis, atom_info, fock=fock,
+                orb_occ=_per_orbital(occupations, orbital_indices),
+                energies=_per_orbital(energies, orbital_indices),
+                indices=orbital_indices,
             )
     except Exception:
         population = None
 
-    return {
+    details = {
         "source_type": source_type,
         "source_path": source_path,
         "spin": spin,
@@ -685,6 +842,10 @@ def _build_source_details(source_type, source_path, spin,
         "population_analysis": population,
         **(context or {}),
     }
+    if population is not None:
+        details["population_basis"] = "AO"
+        details["population_basis_label"] = "AO"
+    return details
 
 
 def _nbo_overlap_candidate_paths(details):
@@ -850,29 +1011,94 @@ def _resolve_transform_key_path(basis):
     return None
 
 
+# A key-file basis is usable when its functions are normalized in the AO
+# metric: diag(T^T S T) = 1. That holds for orthonormal sets (NAO, NBO, NLMO,
+# MO, NO) and pre-orthogonal ones (PNAO, PNHO, PNBO, PNLMO) alike, to within
+# 3e-5 in the test files; a file that only happens to parse to the right size
+# (a .wfx did) is off by orders of magnitude.
+KEY_BASIS_NORM_TOLERANCE = 1e-3
+
+
 def _transform_to_key_basis(cmat, overlap, transform_key_path, spin, nbas):
     """
     Re-express coefficients and overlap in an NBO key-file basis.
 
-    Returns the inputs unchanged (and reports why) if the transformation
-    matrix cannot be loaded or does not match the AO basis size, so the
-    caller falls back to AO.
+    Returns (cmat, overlap, problem). problem is None on success; otherwise it
+    says why the file could not be used (it does not load, has the wrong
+    size, or does not hold a normalized basis), and cmat and overlap come
+    back unchanged, in the AO basis.
     """
+    import nbo_read as _nr
     try:
-        import nbo_read as _nr
         transmat = np.asarray(
             _nr.load_transformation_matrix(transform_key_path, spin),
             dtype=float).T
-        if transmat.shape != (nbas, nbas):
-            raise ValueError(
-                f"Transformation matrix shape {transmat.shape} "
-                f"does not match AO basis size {(nbas, nbas)}"
-            )
-        return np.linalg.inv(transmat) @ cmat, transmat.T @ overlap @ transmat
     except Exception as e:
-        print(f"Failed to transform to selected NBO basis: {e}")
-        # Fall back to AO
-        return cmat, overlap
+        return cmat, overlap, f"it does not hold a basis transformation ({e})"
+    if transmat.shape != (nbas, nbas):
+        return cmat, overlap, (f"its matrix is {transmat.shape[0]} x {transmat.shape[1]}, "
+                               f"the AO basis has {nbas} functions")
+    key_overlap = transmat.T @ overlap @ transmat
+    norm_error = np.abs(np.diag(key_overlap) - 1.0).max() if np.isfinite(key_overlap).all() else np.inf
+    if not norm_error <= KEY_BASIS_NORM_TOLERANCE:
+        return cmat, overlap, ("its functions are not normalized in the AO basis "
+                               f"(off by up to {norm_error:.3g}), so it is not a basis transformation")
+    try:
+        return np.linalg.inv(transmat) @ cmat, key_overlap, None
+    except np.linalg.LinAlgError as e:
+        return cmat, overlap, f"its matrix cannot be inverted ({e})"
+
+
+def _apply_key_basis(cmat, overlap, transform_key_path, spin, nbas):
+    """
+    _transform_to_key_basis plus a record of what happened, for the result:
+    (cmat, overlap, basis_note), where basis_note is None on success or
+    {'requested': file name, 'problem': why} after falling back to AO.
+    """
+    cmat, overlap, problem = _transform_to_key_basis(
+        cmat, overlap, transform_key_path, spin, nbas)
+    if problem is None:
+        return cmat, overlap, None
+    name = os.path.basename(transform_key_path)
+    print(f"Population analysis: {name} could not be used, {problem}; using the AO basis.")
+    return cmat, overlap, {"requested": name, "problem": problem}
+
+
+def _with_basis_note(population, basis_note):
+    """Attach a fallback note (see _apply_key_basis) to a population result."""
+    if population is not None and basis_note is not None:
+        population["basis_fallback"] = basis_note
+    return population
+
+
+def _localized_population_analysis(details, basis, basis_functions, atom_info):
+    """
+    Population analysis of the localized orbitals a details dict carries.
+    They exist only as the coefficients stored with them (the source file
+    holds the canonical MOs), so those are analysed, under their own numbers.
+    """
+    orbitals = details.get("orbitals") or []
+    if not orbitals:
+        return None
+    nbas = len(basis_functions)
+    cmat = np.column_stack([np.asarray(o["coefficients"], dtype=float) for o in orbitals])
+
+    def values(key):
+        return np.array([np.nan if o.get(key) is None else float(o[key]) for o in orbitals])
+
+    # The label base in source_path is not a file; the overlap comes from the
+    # source the orbitals were localized from.
+    overlap = _load_overlap_for_details(
+        {**details, "source_path": details.get("basis_source_path")}, nbas)
+    transform_key_path = _resolve_transform_key_path(basis)
+    basis_note = None
+    if transform_key_path and str(details.get("source_type", "")).lower() == "nbo":
+        cmat, overlap, basis_note = _apply_key_basis(
+            cmat, overlap, transform_key_path, details.get("spin") or "alpha", nbas)
+    return _with_basis_note(_population_analysis_data(
+        cmat, overlap, basis_functions, atom_info,
+        orb_occ=values("occupation"), energies=values("energy"),
+        indices=[int(o["index"]) for o in orbitals]), basis_note)
 
 
 def _compute_population_analysis_from_details(details, basis="AO"):
@@ -883,6 +1109,8 @@ def _compute_population_analysis_from_details(details, basis="AO"):
     atom_info = _deserialise_atom_info(details.get("atom_info"))
     if not basis_functions or not atom_info:
         return None
+    if details.get("localization"):
+        return _localized_population_analysis(details, basis, basis_functions, atom_info)
 
     # Load all orbitals, including unoccupied
     nbas = len(basis_functions)
@@ -908,12 +1136,13 @@ def _compute_population_analysis_from_details(details, basis="AO"):
     # Transform to selected NBO-key basis if requested.  AO remains the default
     # because S and the initially loaded coefficients are in the AO basis.
     transform_key_path = _resolve_transform_key_path(basis)
+    basis_note = None
     if transform_key_path and source_type == "nbo":
-        cmat, overlap = _transform_to_key_basis(
+        cmat, overlap, basis_note = _apply_key_basis(
             cmat, overlap, transform_key_path,
             details.get("spin") or "alpha", nbas)
 
-    return _population_analysis_data(
+    return _with_basis_note(_population_analysis_data(
         cmat,
         overlap,
         basis_functions,
@@ -921,7 +1150,7 @@ def _compute_population_analysis_from_details(details, basis="AO"):
         fock=None,
         orb_occ=occupations,
         energies=energies,
-    )
+    ), basis_note)
 
 
 class _PopulationAnalysisThread(QThread):
@@ -939,6 +1168,7 @@ class _PopulationAnalysisThread(QThread):
             "atom_info": list(details.get("atom_info") or []),
             "basis_functions": list(details.get("basis_functions") or []),
             "orbitals": list(details.get("orbitals") or []),
+            "localization": details.get("localization"),
         }
         self.basis = basis
 
@@ -953,13 +1183,179 @@ class _PopulationAnalysisThread(QThread):
 
 # ── Main class ────────────────────────────────────────────────────────────────
 
+# ── Cube-generation progress (shared by the NBO / fchk / Molden dialogs) ──────
+
+def _format_duration(seconds):
+    """Format seconds as '45 sec', '3 min 15 sec' or '1 h 05 min'."""
+    seconds = int(round(seconds))
+    if seconds < 60:
+        return f"{seconds} sec"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes} min {seconds} sec"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} h {minutes:02d} min"
+
+
+class _CubeWorkerThread(QThread):
+    """
+    Base for worker threads that produce a list of cube grids.
+
+    cube_progress carries (done, total, time.monotonic()) from the
+    progress_callback of grid_utils.evaluate_orbital_grids. Qt queues the
+    signal to the GUI thread, so receivers never touch widgets from the worker.
+    """
+    # Lists of result dicts go out as `object`: a pyqtSignal(list) converts the
+    # dicts through Qt types and copies them, so the cubes of one run would no
+    # longer share one source_details dict (and a population analysis stored
+    # on it would show for one of them only).
+    finished      = pyqtSignal(object)   # list of result dicts (in-memory grids)
+    error         = pyqtSignal(str)    # emits error message string
+    progress      = pyqtSignal(str)    # emits status text
+    cube_progress = pyqtSignal(int, int, float)
+
+    def _report_cube_progress(self, done, total):
+        self.cube_progress.emit(done, total, time.monotonic())
+
+
+class _CubeProgressPanel(QWidget):
+    """
+    Progress bar, 'Generating cube i of n' line and estimated time remaining
+    for one run of cube generation. Hidden until start().
+
+    The percentage counts finished cubes only. The time estimate is
+    grid_utils.estimate_remaining_seconds: actual elapsed time divided by the
+    cubes finished so far, recomputed on every completion. A 1 s timer counts
+    it down between completions.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        self._bar = QProgressBar()
+        self._step_label = QLabel("")
+        self._eta_label = QLabel("")
+        for lbl in (self._step_label, self._eta_label):
+            lbl.setStyleSheet("color:#a6adc8; font-size:9pt;")
+        lay.addWidget(self._bar)
+        lay.addWidget(self._step_label)
+        lay.addWidget(self._eta_label)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self._refresh)
+        self._active = False
+        self._done = self._total = 0
+        self._started = self._last_done_at = None
+        self.hide()
+
+    def _set_bar_color(self, rgba):
+        self._bar.setStyleSheet(
+            "QProgressBar { border:1px solid #45475a; border-radius:4px; "
+            "               background:#313244; color:#cdd6f4; text-align:center; }"
+            f"QProgressBar::chunk {{ background:{rgba}; border-radius:3px; }}")
+
+    def start(self):
+        """Show the panel; it stays busy until the first cube starts."""
+        self._active = True
+        self._done = self._total = 0
+        self._started = self._last_done_at = None
+        self._set_bar_color("rgba(137, 180, 250, 0.6)")
+        self._bar.setRange(0, 0)   # busy indicator while the basis loads / orbitals localize
+        self._bar.setFormat("")
+        self._step_label.setText("Preparing cube generation…")
+        self._eta_label.setText("")
+        self.show()
+        self._timer.start()
+
+    def on_cube_progress(self, done, total, at):
+        """Slot for _CubeWorkerThread.cube_progress."""
+        if not self._active:
+            return
+        self._total = total
+        if done == 0:
+            self._started = at
+        else:
+            self._done = done
+            self._last_done_at = at
+        self._refresh()
+
+    def _refresh(self):
+        if not self._active or self._started is None:
+            return
+        done, total = self._done, self._total
+        percent = int(100 * done / total) if total else 100
+        self._bar.setRange(0, max(total, 1))
+        self._bar.setValue(done)
+        self._bar.setFormat(f"{done} / {total} cubes  ({percent}%)")
+
+        if done >= total:
+            self._step_label.setText(f"All {total} cubes generated, finishing up…")
+            self._eta_label.setText("")
+            return
+        self._step_label.setText(
+            f"Generating cube {done + 1} of {total}  ·  Progress: {percent}%")
+
+        from grid_utils import estimate_remaining_seconds
+        now = time.monotonic()
+        remaining = estimate_remaining_seconds(
+            done, total, self._started, self._last_done_at, now)
+        if remaining is None:
+            self._eta_label.setText(
+                "Estimated time remaining: available after the first cube  "
+                f"({_format_duration(now - self._started)} elapsed)")
+        elif remaining > 0:
+            self._eta_label.setText(
+                f"Estimated time remaining: ~{_format_duration(remaining)}")
+        else:
+            self._eta_label.setText(
+                "Estimated time remaining: taking longer than estimated…")
+
+    def finish(self):
+        """Mark the run as complete: 100 % and the total time taken."""
+        if not self._active:
+            return
+        self._active = False
+        self._timer.stop()
+        total = self._total or self._done
+        self._bar.setRange(0, max(total, 1))
+        self._bar.setValue(max(total, 1))
+        self._bar.setFormat(f"{total} / {total} cubes  (100%)")
+        self._set_bar_color("rgba(166, 227, 161, 0.6)")
+        elapsed = time.monotonic() - self._started if self._started is not None else 0.0
+        self._step_label.setText(
+            f"✓ Finished: {total} cube(s) generated in {_format_duration(elapsed)}")
+        self._eta_label.setText("")
+
+    def fail(self):
+        """Mark the run as failed, keeping the count of cubes that did finish."""
+        if not self._active:
+            return
+        self._active = False
+        self._timer.stop()
+        done, total = self._done, self._total
+        self._set_bar_color("rgba(243, 139, 168, 0.6)")
+        if self._started is None or not total:
+            self._bar.setRange(0, 1)
+            self._bar.setValue(0)
+            self._bar.setFormat("Failed")
+            self._step_label.setText("✗ Cube generation failed before any cube was generated")
+        else:
+            self._bar.setRange(0, total)
+            self._bar.setValue(done)
+            self._bar.setFormat(f"{done} / {total} cubes  (failed)")
+            self._step_label.setText(
+                f"✗ Cube generation failed after {done} of {total} cube(s); "
+                "no cubes were loaded")
+        self._eta_label.setText("")
+
+
 # ── NBO dialog classes (module-level, before MultiCubeVisualizer) ─────────────
 
-class _ComputeThread(QThread):
+class _ComputeThread(_CubeWorkerThread):
     """Worker thread: runs compute_cube_data without blocking the GUI."""
-    finished  = pyqtSignal(list)   # emits list of result dicts (in-memory grids)
-    error     = pyqtSignal(str)    # emits error message string
-    progress  = pyqtSignal(str)    # emits status text
 
     def __init__(self, basis_path, key_path, orbital_indices, spin,
                  grid_quality, ext_dist, parent=None):
@@ -998,6 +1394,7 @@ class _ComputeThread(QThread):
                 selected_indices, self.key_path, self.spin,
                 self.grid_quality, self.ext_dist, bohr_const,
                 precomputed_cmos=selected_cmos,
+                progress_callback=self._report_cube_progress,
             )
             try:
                 ene_a, occ_a, ene_b, occ_b = \
@@ -1025,74 +1422,95 @@ class _ComputeThread(QThread):
 _LOCALIZE_SOURCE_LABELS = {"nbo": "NBO", "fchk": "fchk", "molden": "Molden"}
 
 
-class _LocalizeComputeThread(QThread):
+class _LocalizeThread(QThread):
     """
-    Worker thread: runs localization_io.compute_localized_cube_data without
-    blocking the GUI. One shared thread class for all three source formats
-    -- the per-format branching (incl. the NBO ".40 key file" rule) already
-    lives inside compute_localized_cube_data, so there's no need to triple
-    this the way _ComputeThread/_FchkComputeThread/_MoldenComputeThread are.
+    Worker thread: localization_io.localize_source -- the localization only,
+    no grids. One shared thread class for all three source formats; the
+    per-format branching (incl. the NBO ".40 key file" rule) lives inside
+    localize_source. Results are cached there, so asking again with the same
+    options returns at once.
     """
-    finished = pyqtSignal(list)
-    error    = pyqtSignal(str)
-    progress = pyqtSignal(str)
+    localized = pyqtSignal(object)    # the localize_source() dict
+    error     = pyqtSignal(str)
+    progress  = pyqtSignal(str)
 
-    def __init__(self, path, spin, space, n_occ, orbital_range, seed,
-                 grid_quality, ext_dist, parent=None):
+    def __init__(self, path, spin, space, orbital_range, seed=0, parent=None):
         super().__init__(parent)
         self.path          = path
         self.spin          = spin
         self.space         = space
-        self.n_occ         = n_occ
         self.orbital_range = orbital_range
         self.seed          = seed
-        self.grid_quality  = grid_quality
-        self.ext_dist      = ext_dist
+
+    def run(self):
+        try:
+            import localization_io as _loc
+            self.progress.emit(f"Localizing {self.space} orbitals…")
+            result = _loc.localize_source(
+                self.path, spin=self.spin, space=self.space,
+                orbital_range=self.orbital_range, seed=self.seed)
+            self.localized.emit(result)
+        except Exception:
+            import traceback
+            self.error.emit(traceback.format_exc())
+
+
+class _LocalizedCubesThread(_CubeWorkerThread):
+    """
+    Worker thread: cube grids for the chosen orbitals of a localize_source()
+    result (localization_io.compute_localized_cubes), with the same
+    source_details the other orbital sources attach.
+    """
+
+    def __init__(self, localized, numbers, grid_quality, ext_dist, parent=None):
+        super().__init__(parent)
+        self.localized    = localized
+        self.numbers      = list(numbers)
+        self.grid_quality = grid_quality
+        self.ext_dist     = ext_dist
 
     def run(self):
         try:
             import localization_io as _loc
             from scipy.constants import physical_constants
             bohr_const = physical_constants['Bohr radius'][0] * 1e10
+            loc = self.localized
 
-            self.progress.emit(f"Localizing {self.space} orbitals…")
-            result = _loc.compute_localized_cube_data(
-                self.path, spin=self.spin, space=self.space,
-                n_occ=self.n_occ, orbital_range=self.orbital_range,
-                seed=self.seed, grid_quality=self.grid_quality,
+            self.progress.emit(f"Computing {len(self.numbers)} localized orbital(s)…")
+            cubes = _loc.compute_localized_cubes(
+                loc, self.numbers, grid_quality=self.grid_quality,
                 ext_dist=self.ext_dist, bohr_const=bohr_const,
-            )
+                progress_callback=self._report_cube_progress)
 
-            source_type = _loc._recognize_source_type(self.path)
-            base = os.path.splitext(os.path.basename(self.path))[0]
-            # No '.' before LOC: _build_source_details() recovers the
-            # label base with os.path.splitext(), which would otherwise
+            # label_base has no '.' before LOC: _build_source_details() recovers
+            # the label base with os.path.splitext(), which would otherwise
             # misparse ".LOC_<space>" as a file extension and desync these
-            # per-orbital labels from the cube labels compute_localized_
-            # cube_data() already assigned (breaking the population-info
-            # lookup in _current_population_summary(), which matches on
-            # label equality).
+            # per-orbital labels from the cube labels (breaking the
+            # population-info lookup in _current_population_summary(), which
+            # matches on label equality).
             details = _build_source_details(
-                _LOCALIZE_SOURCE_LABELS.get(source_type, source_type),
-                f"{base}_LOC_{result['space']}", self.spin,
-                result["final_basis"], result["atom_info"],
-                result["orbital_indices"], list(result["localized_cmo"].T),
-                energies=result["energies"], occupations=result["occupations"],
-                overlap=result["overlap"], fock=result["fock"],
+                _LOCALIZE_SOURCE_LABELS.get(loc["source_type"], loc["source_type"]),
+                loc["label_base"], loc["spin"],
+                loc["final_basis"], loc["atom_info"],
+                self.numbers, [loc["localized_cmo"][:, n - 1] for n in self.numbers],
+                energies=loc["energies"], occupations=loc["occupations"],
+                overlap=loc["overlap"], fock=loc["fock"],
+                # NBO sources offer a choice of basis (AO, NAO, NBO, ...) for the
+                # population analysis, asked when population info is shown.
+                precompute_population=loc["source_type"] != "nbo",
                 context={
-                    "basis_source_path": self.path,
+                    "basis_source_path": loc["path"],
                     "localization": {
-                        "space": result["space"],
-                        "n_occ": result["n_occ"],
-                        "seed": self.seed,
+                        "space": loc["space"],
+                        "n_occ": loc["n_occ"],
+                        "seed": loc["seed"],
                     },
                 },
             )
-            for r in result["cubes"]:
-                r["source_details"] = details
-
-            self.progress.emit(f"{len(result['cubes'])} localized orbital(s) ready")
-            self.finished.emit(result["cubes"])
+            for cube in cubes:
+                cube["source_details"] = details
+            self.progress.emit(f"{len(cubes)} localized orbital(s) ready")
+            self.finished.emit(cubes)
         except Exception:
             import traceback
             self.error.emit(traceback.format_exc())
@@ -1102,7 +1520,7 @@ class _SpinDensityComputeThread(QThread):
     """
     Worker thread: runs density_analysis.compute_spin_density_cube_data
     without blocking the GUI. One shared thread class for all three source
-    formats, same rationale as _LocalizeComputeThread.
+    formats, same rationale as _LocalizeThread.
     """
     finished = pyqtSignal(dict)
     error    = pyqtSignal(str)
@@ -1296,13 +1714,246 @@ class _LocalizeOptionsDialog(QDialog):
         return "range", (self.first_spin.value(), self.last_spin.value())
 
 
+class _LocalizedOrbitalPickerDialog(QDialog):
+    """
+    Pick which localized orbitals to display, like the MO picker: one row per
+    localized orbital (number, energy, occupation and the atoms it sits on),
+    nothing checked at first, and grids are computed only for the checked
+    ones. Grid quality and extension come from the orbital picker that
+    started the localization.
+    """
+    _UNIT_FACTORS = {"Ha": 1.0, "eV": 27.2114, "kcal/mol": 627.509}
+    _UNIT_FORMATS = {"Ha": "{:10.4f}", "eV": "{:9.3f}", "kcal/mol": "{:10.2f}"}
+
+    def __init__(self, localized, grid_quality, ext_dist, parent=None):
+        super().__init__(parent)
+        self.localized    = localized
+        self.grid_quality = grid_quality
+        self.ext_dist     = ext_dist
+        self.results      = []
+        self._thread      = None
+        self._unit        = "Ha"
+        self._checkboxes  = []
+        self._energy_labels = []
+        n = len(localized["orbital_indices"])
+        self.setWindowTitle(f"Select Localized Orbitals — {localized['label_base']}")
+        self.setMinimumWidth(760)
+        self.setMinimumHeight(640)
+        self.setStyleSheet(getattr(parent, "DARK", ""))
+
+        layout = QVBoxLayout(self)
+        header = QLabel(
+            f"<b>{n} localized orbital(s)</b>&nbsp;&nbsp;"
+            f"<span style='color:#7dd3fc'>{localized['space']}, {localized['spin']}</span>"
+            "&nbsp;&nbsp;Check the ones to display; grids are computed only for those.")
+        header.setWordWrap(True)
+        layout.addWidget(header)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Energy unit:"))
+        self.unit_combo = QComboBox(); self.unit_combo.addItems(list(self._UNIT_FACTORS))
+        self.unit_combo.currentTextChanged.connect(self._on_unit_changed)
+        top.addWidget(self.unit_combo)
+        top.addStretch()
+        layout.addLayout(top)
+
+        quick = QHBoxLayout()
+        all_btn, none_btn = QPushButton("Select All"), QPushButton("Select None")
+        all_btn.clicked.connect(lambda: self._set_checked(range(1, n + 1)))
+        none_btn.clicked.connect(lambda: self._set_checked([]))
+        quick.addWidget(all_btn); quick.addWidget(none_btn)
+        quick.addWidget(QLabel("Range:"))
+        self.range_edit = QLineEdit(); self.range_edit.setPlaceholderText("1,3,5-12")
+        range_btn = QPushButton("Apply")
+        range_btn.clicked.connect(lambda: self._set_checked(_parse_index_ranges(self.range_edit.text())))
+        quick.addWidget(self.range_edit); quick.addWidget(range_btn)
+        quick.addWidget(QLabel("Centred on:"))
+        self.atom_combo = QComboBox()
+        for a in sorted({c[0][0] for c in localized["centres"]}):
+            self.atom_combo.addItem(self._atom_name(a), a)
+        self.atom_combo.setToolTip("Select the localized orbitals whose largest share is on this atom")
+        atom_btn = QPushButton("Select")
+        atom_btn.clicked.connect(self._select_by_atom)
+        quick.addWidget(self.atom_combo); quick.addWidget(atom_btn)
+        quick.addStretch()
+        layout.addLayout(quick)
+
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        inner = QWidget(); inner.setObjectName("inner_widget")
+        grid = QGridLayout(inner); grid.setVerticalSpacing(2); grid.setHorizontalSpacing(18)
+        for col, title in enumerate(("", "Energy", "Occupation", "Centred on")):
+            head = QLabel(f"<b>{title}</b>"); grid.addWidget(head, 0, col)
+        mono = "font-family:Consolas,monospace; font-size:10pt; color:#cdd6f4;"
+        occupations = localized["occupations"]
+        for i in range(n):
+            cb = QCheckBox(f"LMO {i + 1}")
+            cb.toggled.connect(self._update_count)
+            self._checkboxes.append(cb)
+            energy = QLabel(""); energy.setStyleSheet(mono)
+            self._energy_labels.append(energy)
+            occ = QLabel("—" if occupations is None else f"{occupations[i]:5.3f}")
+            occ.setStyleSheet(mono)
+            where = QLabel(self._centres_text(localized["centres"][i]))
+            where.setStyleSheet(mono)
+            for col, w in enumerate((cb, energy, occ, where)):
+                grid.addWidget(w, i + 1, col)
+        grid.setColumnStretch(3, 1)
+        scroll.setWidget(inner)
+        layout.addWidget(scroll, stretch=1)
+        self._on_unit_changed(self._unit)
+
+        self.count_label = QLabel("")
+        layout.addWidget(self.count_label)
+        layout.addWidget(QLabel(
+            f"Grid: {grid_quality} points along the widest axis, extension {ext_dist:.1f} bohr "
+            "(from the orbital picker)"))
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color:#a6adc8; font-size:9pt;")
+        layout.addWidget(self.status_label)
+        self.cube_progress_panel = _CubeProgressPanel()
+        layout.addWidget(self.cube_progress_panel)
+
+        buttons = QHBoxLayout()
+        self.cancel_btn = QPushButton("Cancel")
+        self.compute_btn = QPushButton("▶  Compute Selected Orbitals")
+        self.compute_btn.setStyleSheet(
+            "QPushButton { background:#89b4fa; color:#1e1e2e; font-weight:bold; "
+            "              padding:8px 20px; border-radius:5px; font-size:10pt; }")
+        self.cancel_btn.clicked.connect(self.reject)
+        self.compute_btn.clicked.connect(self._start_compute)
+        buttons.addStretch(); buttons.addWidget(self.cancel_btn); buttons.addWidget(self.compute_btn)
+        layout.addLayout(buttons)
+        self._update_count()
+
+    def _atom_name(self, atom_index):
+        z = int(self.localized["atom_info"][atom_index][0])
+        symbol = MultiCubeVisualizer.ELEMENT_DATA.get(z, (f"Z{z}",))[0]
+        return f"{symbol}{atom_index + 1}"
+
+    def _centres_text(self, centres):
+        return "  ·  ".join(f"{self._atom_name(a)} {100 * f:3.0f}%" for a, f in centres)
+
+    def _on_unit_changed(self, unit):
+        self._unit = unit
+        factor, fmt = self._UNIT_FACTORS[unit], self._UNIT_FORMATS[unit]
+        for label, energy in zip(self._energy_labels, self.localized["energies"]):
+            label.setText(f"{fmt.format(float(energy) * factor)} {unit}")
+
+    def selected_numbers(self):
+        return [i + 1 for i, cb in enumerate(self._checkboxes) if cb.isChecked()]
+
+    def _set_checked(self, numbers):
+        wanted = set(numbers)
+        for i, cb in enumerate(self._checkboxes):
+            with QSignalBlocker(cb):
+                cb.setChecked(i + 1 in wanted)
+        self._update_count()
+
+    def _select_by_atom(self):
+        atom = self.atom_combo.currentData()
+        self._set_checked([i + 1 for i, c in enumerate(self.localized["centres"])
+                           if c[0][0] == atom])
+
+    def _update_count(self, *_):
+        k = len(self.selected_numbers())
+        self.count_label.setText(f"{k} of {len(self._checkboxes)} selected")
+        self.compute_btn.setEnabled(k > 0 and self._thread is None)
+
+    def _start_compute(self):
+        numbers = self.selected_numbers()
+        if not numbers:
+            return
+        self.compute_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(False)
+        self._thread = _LocalizedCubesThread(
+            self.localized, numbers, self.grid_quality, self.ext_dist, parent=self)
+        self._thread.progress.connect(self.status_label.setText)
+        self._thread.cube_progress.connect(self.cube_progress_panel.on_cube_progress)
+        self._thread.finished.connect(self._on_done)
+        self._thread.error.connect(self._on_error)
+        self.cube_progress_panel.start()
+        self._thread.start()
+
+    def _on_done(self, cubes):
+        self.cube_progress_panel.finish()
+        self.results = list(cubes)
+        self.accept()
+
+    def _on_error(self, msg):
+        self._thread = None
+        self.cube_progress_panel.fail()
+        self.status_label.setText("✗ Computation failed")
+        self.cancel_btn.setEnabled(True)
+        self._update_count()
+        QMessageBox.critical(self, "Computation Error", msg)
+
+
+def _parse_index_ranges(text):
+    """'1,3,5-12' -> {1, 3, 5, ..., 12}; malformed parts are skipped."""
+    numbers = set()
+    for part in text.split(','):
+        part = part.strip()
+        try:
+            if '-' in part:
+                a, b = map(int, part.split('-'))
+                numbers.update(range(a, b + 1))
+            elif part:
+                numbers.add(int(part))
+        except ValueError:
+            pass
+    return numbers
+
+
+def _start_localization(picker, path):
+    """
+    "Localize Orbitals…" in an orbital picker (NBO, fchk or Molden): ask for
+    the subspace, localize in the background without computing any grids,
+    then let the user pick which localized orbitals to display. The picker
+    needs nbas, quality_combo, ext_slider, spin_combo, compute_btn,
+    status_label, cubes_ready and _on_compute_error.
+    """
+    dlg = _LocalizeOptionsDialog(picker.nbas, parent=picker)
+    _DialogCenterFilter.center(dlg)
+    if dlg.exec_() != QDialog.Accepted:
+        return
+    space, orbital_range = dlg.selection()
+    spin = "beta" if (picker.spin_combo and picker.spin_combo.currentIndex() == 1) else "alpha"
+
+    picker.compute_btn.setEnabled(False)
+    picker.status_label.setText(f"Localizing {space} orbitals…")
+    thread = _LocalizeThread(path, spin, space, orbital_range, parent=picker)
+    picker._localize_thread = thread
+    thread.progress.connect(picker.status_label.setText)
+    thread.localized.connect(lambda loc: _pick_localized_orbitals(picker, loc))
+    thread.error.connect(picker._on_compute_error)
+    thread.start()
+
+
+def _pick_localized_orbitals(picker, localized):
+    """Show the localized orbitals; emit the computed cubes and close the picker."""
+    picker.compute_btn.setEnabled(True)
+    n = len(localized["orbital_indices"])
+    picker.status_label.setText(f"{n} localized orbital(s) ready — choose which to display")
+    dlg = _LocalizedOrbitalPickerDialog(
+        localized, grid_quality_of(picker.quality_combo),
+        picker.ext_slider.value() / 10.0, parent=picker)
+    _DialogCenterFilter.center(dlg)
+    if dlg.exec_() == QDialog.Accepted and dlg.results:
+        picker.cubes_ready.emit(dlg.results)
+        picker.accept()
+    else:
+        picker.status_label.setText(
+            "No localized orbitals loaded. Localize Orbitals… with the same options "
+            "reopens the list without localizing again.")
+
+
 class _OrbitalPickerDialog(QDialog):
     """
     Enhanced orbital selection dialog for NBO visualization.
     Shows orbital indices with computed energies (Hartree + eV) and occupations.
     Supports both closed-shell and open-shell calculations.
     """
-    cubes_ready = pyqtSignal(list)   # emits list of in-memory result dicts
+    cubes_ready = pyqtSignal(object)   # list of in-memory result dicts (see _CubeWorkerThread)
 
   
 
@@ -1594,6 +2245,8 @@ class _OrbitalPickerDialog(QDialog):
         self.status_label = QLabel("")
         self.status_label.setStyleSheet("color:#a6adc8; font-size:9pt;")
         layout.addWidget(self.status_label)
+        self.cube_progress_panel = _CubeProgressPanel()
+        layout.addWidget(self.cube_progress_panel)
 
         # ── Action Buttons ────────────────────────────────────────────────────
         btn_row = QHBoxLayout()
@@ -1618,31 +2271,10 @@ class _OrbitalPickerDialog(QDialog):
         cancel_btn.clicked.connect(self.reject)
 
     def _open_localize_dialog(self):
-        dlg = _LocalizeOptionsDialog(self.nbas, parent=self)
-        _DialogCenterFilter.center(dlg)
-        if dlg.exec_() != QDialog.Accepted:
-            return
-        space, orbital_range = dlg.selection()
-
-        grid_quality = grid_quality_of(self.quality_combo)
-        ext_dist = self.ext_slider.value() / 10.0
-        spin = "beta" if (self.spin_combo and self.spin_combo.currentIndex() == 1) else "alpha"
-
-        self.compute_btn.setEnabled(False)
-        self.status_label.setText(f"Localizing {space} orbitals…")
-
         # self.basis_path may be a sibling .31 (_KeyFilePickerDialog accepts
         # either as a starting point) -- localization needs the .47 file
         # specifically (it holds $FOCK), same requirement get_fock_matrix has.
-        basis47 = os.path.splitext(self.basis_path)[0] + ".47"
-
-        self._thread = _LocalizeComputeThread(
-            basis47, spin, space, None, orbital_range, 0,
-            grid_quality, ext_dist, parent=self)
-        self._thread.progress.connect(self.status_label.setText)
-        self._thread.finished.connect(self._on_compute_done)
-        self._thread.error.connect(self._on_compute_error)
-        self._thread.start()
+        _start_localization(self, os.path.splitext(self.basis_path)[0] + ".47")
 
     def _open_spin_density_dialog(self):
         dlg = _DensityTypeDialog(self.is_open_shell, parent=self)
@@ -1849,6 +2481,8 @@ class _OrbitalPickerDialog(QDialog):
             grid_quality, ext_dist, parent=self)
         
         self._thread.progress.connect(self.status_label.setText)
+        self._thread.cube_progress.connect(self.cube_progress_panel.on_cube_progress)
+        self.cube_progress_panel.start()
         self._thread.finished.connect(self._on_compute_done)
         self._thread.error.connect(self._on_compute_error)
         self._compute_start_time = time.time()  # Start timer
@@ -1865,12 +2499,14 @@ class _OrbitalPickerDialog(QDialog):
         elapsed = time.time() - self._compute_start_time if self._compute_start_time else 0
         time_str = f"{elapsed:.1f}s" if elapsed < 60 else f"{elapsed/60:.1f}m"
         self.status_label.setText(f" {len(results)} orbital grid(s) ready  |  {time_str}")
+        self.cube_progress_panel.finish()
         self.cubes_ready.emit(results)
         self.accept()
 
     def _on_compute_error(self, msg):
         self.compute_btn.setEnabled(True)
         self.status_label.setText("✗ Computation failed")
+        self.cube_progress_panel.fail()
         QMessageBox.critical(self, "Computation Error", msg)
 
 
@@ -1879,7 +2515,7 @@ class _KeyFilePickerDialog(QDialog):
     Step 1: given a basis file path, show all sibling key files (same stem,
     different extension) and let the user pick one to proceed with.
     """
-    cubes_ready = pyqtSignal(list)
+    cubes_ready = pyqtSignal(object)
 
     DARK = _OrbitalPickerDialog.DARK  # reuse same stylesheet
 
@@ -1995,11 +2631,8 @@ class _KeyFilePickerDialog(QDialog):
 
 # ── fchk orbital picker ──────────────────────────────────────────────────────
 
-class _FchkComputeThread(QThread):
+class _FchkComputeThread(_CubeWorkerThread):
     """Worker thread: calls fchk_read.compute_cube_data_fchk without blocking the GUI."""
-    finished = pyqtSignal(list)
-    error    = pyqtSignal(str)
-    progress = pyqtSignal(str)
 
     def __init__(self, fchk_path, orbital_indices, spin,
                  grid_quality, ext_dist, parent=None):
@@ -2039,6 +2672,7 @@ class _FchkComputeThread(QThread):
                 self.grid_quality, self.ext_dist, bohr_const,
                 precomputed_cmos=selected_cmos,
                 precomputed_basis=(basis, coords, atom_info),
+                progress_callback=self._report_cube_progress,
             )
             try:
                 ene_a, occ_a, ene_b, occ_b = \
@@ -2068,7 +2702,7 @@ class _FchkOrbitalPickerDialog(QDialog):
     Mirrors _OrbitalPickerDialog but reads energies, occupations, and MO
     coefficients directly from the fchk file via fchk_read.
     """
-    cubes_ready = pyqtSignal(list)
+    cubes_ready = pyqtSignal(object)
 
     DARK = _OrbitalPickerDialog.DARK   # reuse stylesheet
 
@@ -2247,6 +2881,8 @@ class _FchkOrbitalPickerDialog(QDialog):
         self.status_label = QLabel("")
         self.status_label.setStyleSheet("color:#a6adc8; font-size:9pt;")
         layout.addWidget(self.status_label)
+        self.cube_progress_panel = _CubeProgressPanel()
+        layout.addWidget(self.cube_progress_panel)
 
         btn_row = QHBoxLayout()
         self.compute_btn = QPushButton("▶  Compute Selected Orbitals")
@@ -2269,26 +2905,7 @@ class _FchkOrbitalPickerDialog(QDialog):
         cancel_btn.clicked.connect(self.reject)
 
     def _open_localize_dialog(self):
-        dlg = _LocalizeOptionsDialog(self.nbas, parent=self)
-        _DialogCenterFilter.center(dlg)
-        if dlg.exec_() != QDialog.Accepted:
-            return
-        space, orbital_range = dlg.selection()
-
-        grid_quality = grid_quality_of(self.quality_combo)
-        ext_dist = self.ext_slider.value() / 10.0
-        spin = "beta" if (self.spin_combo and self.spin_combo.currentIndex() == 1) else "alpha"
-
-        self.compute_btn.setEnabled(False)
-        self.status_label.setText(f"Localizing {space} orbitals…")
-
-        self._thread = _LocalizeComputeThread(
-            self.fchk_path, spin, space, None, orbital_range, 0,
-            grid_quality, ext_dist, parent=self)
-        self._thread.progress.connect(self.status_label.setText)
-        self._thread.finished.connect(self._on_compute_done)
-        self._thread.error.connect(self._on_compute_error)
-        self._thread.start()
+        _start_localization(self, self.fchk_path)
 
     def _open_spin_density_dialog(self):
         dlg = _DensityTypeDialog(self.is_open_shell, parent=self)
@@ -2447,6 +3064,8 @@ class _FchkOrbitalPickerDialog(QDialog):
             self.fchk_path, indices, spin,
             grid_quality, ext_dist, parent=self)
         self._thread.progress.connect(self.status_label.setText)
+        self._thread.cube_progress.connect(self.cube_progress_panel.on_cube_progress)
+        self.cube_progress_panel.start()
         self._thread.finished.connect(self._on_compute_done)
         self._thread.error.connect(self._on_compute_error)
         self._compute_start_time = time.time()  # Start timer
@@ -2463,20 +3082,19 @@ class _FchkOrbitalPickerDialog(QDialog):
         elapsed = time.time() - self._compute_start_time if self._compute_start_time else 0
         time_str = f"{elapsed:.1f}s" if elapsed < 60 else f"{elapsed/60:.1f}m"
         self.status_label.setText(f"✓ {len(results)} orbital grid(s) ready  |  {time_str}")
+        self.cube_progress_panel.finish()
         self.cubes_ready.emit(results)
         self.accept()
 
     def _on_compute_error(self, msg):
         self.compute_btn.setEnabled(True)
         self.status_label.setText("✗ Computation failed")
+        self.cube_progress_panel.fail()
         QMessageBox.critical(self, "Computation Error", msg)
 
 
-class _MoldenComputeThread(QThread):
+class _MoldenComputeThread(_CubeWorkerThread):
     """Worker thread: calls read_molden.compute_cube_data_molden without blocking the GUI."""
-    finished = pyqtSignal(list)
-    error    = pyqtSignal(str)
-    progress = pyqtSignal(str)
 
     def __init__(self, molden_path, orbital_indices, spin,
                  grid_quality, ext_dist, parent=None):
@@ -2512,6 +3130,7 @@ class _MoldenComputeThread(QThread):
                 self.grid_quality, self.ext_dist, bohr_const,
                 precomputed_cmos=selected_cmos,
                 precomputed_basis=(basis, coords, atom_info),
+                progress_callback=self._report_cube_progress,
             )
             try:
                 ene_a, occ_a, ene_b, occ_b = \
@@ -2540,7 +3159,7 @@ class _MoldenOrbitalPickerDialog(QDialog):
     Orbital selection dialog for .molden files.
     Mirrors _FchkOrbitalPickerDialog but reads orbitals from read_molden.
     """
-    cubes_ready = pyqtSignal(list)
+    cubes_ready = pyqtSignal(object)
 
     DARK = _OrbitalPickerDialog.DARK
     _UNIT_FACTORS = {"Ha": 1.0, "eV": 27.2114, "kcal/mol": 627.509}
@@ -2713,6 +3332,8 @@ class _MoldenOrbitalPickerDialog(QDialog):
         self.status_label = QLabel("")
         self.status_label.setStyleSheet("color:#a6adc8; font-size:9pt;")
         layout.addWidget(self.status_label)
+        self.cube_progress_panel = _CubeProgressPanel()
+        layout.addWidget(self.cube_progress_panel)
 
         btn_row = QHBoxLayout()
         self.compute_btn = QPushButton("▶  Compute Selected Orbitals")
@@ -2735,26 +3356,7 @@ class _MoldenOrbitalPickerDialog(QDialog):
         cancel_btn.clicked.connect(self.reject)
 
     def _open_localize_dialog(self):
-        dlg = _LocalizeOptionsDialog(self.nbas, parent=self)
-        _DialogCenterFilter.center(dlg)
-        if dlg.exec_() != QDialog.Accepted:
-            return
-        space, orbital_range = dlg.selection()
-
-        grid_quality = grid_quality_of(self.quality_combo)
-        ext_dist = self.ext_slider.value() / 10.0
-        spin = "beta" if (self.spin_combo and self.spin_combo.currentIndex() == 1) else "alpha"
-
-        self.compute_btn.setEnabled(False)
-        self.status_label.setText(f"Localizing {space} orbitals…")
-
-        self._thread = _LocalizeComputeThread(
-            self.molden_path, spin, space, None, orbital_range, 0,
-            grid_quality, ext_dist, parent=self)
-        self._thread.progress.connect(self.status_label.setText)
-        self._thread.finished.connect(self._on_compute_done)
-        self._thread.error.connect(self._on_compute_error)
-        self._thread.start()
+        _start_localization(self, self.molden_path)
 
     def _open_spin_density_dialog(self):
         dlg = _DensityTypeDialog(self.is_open_shell, parent=self)
@@ -2815,6 +3417,8 @@ class _MoldenOrbitalPickerDialog(QDialog):
             self.molden_path, indices, spin,
             grid_quality, ext_dist, parent=self)
         self._thread.progress.connect(self.status_label.setText)
+        self._thread.cube_progress.connect(self.cube_progress_panel.on_cube_progress)
+        self.cube_progress_panel.start()
         self._thread.finished.connect(self._on_compute_done)
         self._thread.error.connect(self._on_compute_error)
         self._compute_start_time = time.time()  # Start timer
@@ -4051,6 +4655,37 @@ class SourceDetailsDialog(QDialog):
         return widget
 
 
+class _CubeFileLoadThread(QThread):
+    """Parse .cube files off the GUI thread; emits (index, path, cube dict or exception)."""
+    file_done = pyqtSignal(int, str, object)
+
+    def __init__(self, paths, reader, parent=None):
+        super().__init__(parent)
+        self.paths, self.reader = list(paths), reader
+
+    def run(self):
+        for i, path in enumerate(self.paths):
+            try:
+                cube = self.reader(path)
+            except Exception as e:      # reported by the GUI when the list is rebuilt
+                cube = e
+            self.file_done.emit(i, path, cube)
+
+
+class _CloseGuard(QObject):
+    """Event filter that asks before the main window closes (unsaved computed cubes)."""
+
+    def __init__(self, confirm, parent=None):
+        super().__init__(parent)
+        self._confirm = confirm
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Close and not self._confirm():
+            event.ignore()
+            return True
+        return False
+
+
 class MultiCubeVisualizer:
     # (symbol, vdw_radius_Å, cov_radius_Å, bs_display_radius_Å, cpk_color)
     #
@@ -4204,6 +4839,11 @@ class MultiCubeVisualizer:
     #   half-a-radius on each end so it reaches cleanly into the atom centre.
     #   Result: a pure stick representation with no visible end-cap artefacts.
     #
+    # Tubes (the Mathematica notebook's "Tubes" theme, also called licorice):
+    #   Bonds only, one radius, ending in spheres of that same radius, so
+    #   every tube end and joint is rounded. Each bond is split in colour at
+    #   its midpoint, as Mathematica does.
+    #
     # Space Filling:
     #   Atoms  → full VDW radius (CPK model), no bonds
     # -------------------------------------------------------------------------
@@ -4216,6 +4856,11 @@ class MultiCubeVisualizer:
             mode='sticks',
             bond_radius_A=0.10,
         ),
+        # 0.17 A matched the notebook's tube thickness in side-by-side renders.
+        "Tubes": dict(
+            mode='tubes',
+            bond_radius_A=0.17,
+        ),
         "Space Filling": dict(
             mode='space_filling',
             bond_radius_A=0.00,
@@ -4223,24 +4868,35 @@ class MultiCubeVisualizer:
     }
 
     def __init__(self, cube_files=None):
-        self.cube_files = list(cube_files) if cube_files else []
+        self.cube_store = cube_store.CubeStore()   # grids on disk + small RAM cache
+        self.cube_files = [os.path.abspath(f) for f in cube_files] if cube_files else []
         self.current_cube_index = 0
         self.cubes = []
         for fname in self.cube_files:
-            self.cubes.append(self.read_cube(fname))
+            self.cubes.append(self._make_record(self.read_cube(fname), source_path=fname,
+                                                label=os.path.basename(fname)))
         # (no ValueError if empty — user can drag files in later)
 
         self.current_isovalue  = 0.03
         self.current_mol_theme = "Ball and Stick"
         self.surface_opacity   = 1.0
-        self.show_wireframe    = True
+        self.show_wireframe    = True    # the mesh overlay on the lobes
+        self.close_open_lobes  = False   # pad the grid so lobes cut by the box close
+        self.open_lobes        = False   # last contour left a lobe cut open
         self.show_atom_labels  = False
         self.show_population_info = False
         self.background_color  = 'black'
 
-        self.lobe_pos_color  = LOBE_COLOR_SCHEMES["Crimson / Steel-blue (default)"][0]
-        self.lobe_neg_color  = LOBE_COLOR_SCHEMES["Crimson / Steel-blue (default)"][1]
+        self.lobe_palette    = appearance.DEFAULT_PALETTE
+        self.lobe_pos_color  = LOBE_POS_COLOR
+        self.lobe_neg_color  = LOBE_NEG_COLOR
         self.color_scheme_combo = None
+        self._appearance_widgets = {}          # filled by _build_appearance_content
+        self._appearance_timer = None
+        self._pending_appearance_parts = set()
+        self._label_atom_indices = []
+        self._label_offset_key = None
+        self._label_observer = None
 
         self.pos_actor       = None
         self.neg_actor       = None
@@ -4257,6 +4913,7 @@ class MultiCubeVisualizer:
         self.selected_atom_highlights = []
 
         self.plotter                    = None
+        self._camera_framed             = False  # set once the first molecule has been framed
         self.app                        = None
         self.main_window                = None
         self._isovalue_timer            = None
@@ -4285,6 +4942,8 @@ class MultiCubeVisualizer:
         self.source_details_btn         = None
         self.source_details             = None
         self._population_thread         = None
+        self._population_target         = None   # details dict the running analysis is for
+        self._population_choice         = None   # (label, value) of the last basis picked
         self._population_progress       = None
 
         # Session state
@@ -4294,8 +4953,13 @@ class MultiCubeVisualizer:
         # Open panel references (non-modal dialogs)
         self._panels                    = {}
 
-        # SSAO
-        self.ssao_enabled               = False
+        # Lights, materials and depth peeling (see rendering_style)
+        self.render_style               = rendering_style.RenderStyle()
+        self._style_base_preset         = rendering_style.DEFAULT_PRESET
+        self._lighting_timer            = None
+        self._light_preset_buttons      = {}     # preset name -> radio button
+        self._light_widgets             = {}     # control name -> (slider, spin box)
+        self.rim_check = self.lock_check = None
 
         # Viewport measurement annotation actors
         self.measurement_actors         = []
@@ -4315,41 +4979,16 @@ class MultiCubeVisualizer:
     # ── Cube I/O ──────────────────────────────────────────────────────────────
 
     def read_cube(self, fname):
-        with open(fname) as f:
-            f.readline(); f.readline()
-            parts  = f.readline().split()
-            natoms = int(parts[0])
-            origin = np.array([float(x) for x in parts[1:4]])
-            nx, *xvec = [float(x) for x in f.readline().split()]
-            ny, *yvec = [float(x) for x in f.readline().split()]
-            nz, *zvec = [float(x) for x in f.readline().split()]
-            unit_bohr = (xvec[0] > 0)
-            atoms, coords, coord_lines = [], [], []
-            for _ in range(int(natoms)):
-                p  = f.readline().split()
-                an = abs(int(p[0]))
-                atoms.append(an)
-                c  = [float(x) for x in p[2:5]]
-                coords.append(c)
-                coord_lines.append([an] + c)
-            data = []
-            for line in f:
-                data.extend(float(x) for x in line.split())
-        nx, ny, nz = int(nx), int(ny), int(nz)
-        if len(data) != nx * ny * nz:
-            raise ValueError(f"Data size mismatch in {fname}")
-        self.unit_bohr = unit_bohr
-        bonds = self._detect_bonds(coord_lines, unit_bohr)
-        return dict(
-            origin=origin,
-            spacing=(xvec[0], yvec[1], zvec[2]),
-            dimensions=(nx, ny, nz),
-            atoms=np.array(atoms),
-            coordinates=np.array(coords),
-            data=np.array(data).reshape((nx, ny, nz)),
-            bonds=bonds,
-            unit_bohr=unit_bohr,
-        )
+        """
+        Parse a .cube file into a plain cube dict (cube_store.parse_cube_file
+        reads the values in chunks straight into NumPy). The caller turns it
+        into a CubeRecord, which moves the grid to the disk-backed store.
+        """
+        parsed = cube_store.parse_cube_file(fname)
+        coord_lines = parsed.pop('coord_lines')
+        self.unit_bohr = parsed['unit_bohr']
+        parsed['bonds'] = self._detect_bonds(coord_lines, parsed['unit_bohr'])
+        return parsed
 
     def _detect_bonds(self, coord_lines, unit_bohr):
         atoms = [{'an': p[0], 'xyz': (p[1], p[2], p[3])} for p in coord_lines]
@@ -4377,7 +5016,10 @@ class MultiCubeVisualizer:
         grid = pv.ImageData(dimensions=cube['dimensions'],
                             spacing=cube['spacing'],
                             origin=cube['origin'])
-        grid.point_data['values'] = cube['data'].flatten(order='F')
+        # The store keeps grids Fortran-ordered, so ravel(order='F') is a view
+        # and VTK uses the (possibly memory-mapped) array without a copy; the
+        # grid only lives while the isosurfaces are extracted.
+        grid.point_data['values'] = np.asarray(cube['data']).ravel(order='F')
         return grid
 
     # ── Atom radius (native units) ─────────────────────────────────────────────
@@ -4392,7 +5034,7 @@ class MultiCubeVisualizer:
         vdw, cov, bs_r = e[1], e[2], e[3]
         mode = self.MOLECULE_THEMES[self.current_mol_theme]['mode']
         if mode == 'ball_and_stick':
-            r_ang = bs_r           # hand-tuned per-row display radius
+            r_ang = bs_r                       # per-row display radius
         elif mode == 'space_filling':
             r_ang = space_filling_radius(vdw, cov)   # true VDW radius
         else:
@@ -4409,7 +5051,9 @@ class MultiCubeVisualizer:
         rather than the isosurface, whose extent varies a lot between orbitals.
         """
         cube   = self.cubes[self.current_cube_index]
-        coords = np.asarray(cube['coordinates'])
+        coords = np.asarray(cube['coordinates'], dtype=float).reshape(-1, 3)
+        if len(coords) == 0:
+            return None
         radii  = np.array([self._atom_display_radius(an) for an in cube['atoms']])
         mins   = (coords - radii[:, None]).min(axis=0)
         maxs   = (coords + radii[:, None]).max(axis=0)
@@ -4421,45 +5065,72 @@ class MultiCubeVisualizer:
             center[2] - half[2], center[2] + half[2],
         )
 
+    def _molecule_center(self):
+        """
+        The one reference centre for camera framing: the middle of the atom
+        spheres' bounding box (the point _fit_camera_to_atoms centres on).
+        Standard views focus here too, so a view change followed by an export
+        does not shift the molecule. None when the cube has no atoms.
+        """
+        bounds = self._atom_bounds()
+        if bounds is None:
+            return None
+        return np.array([(bounds[0] + bounds[1]) / 2,
+                         (bounds[2] + bounds[3]) / 2,
+                         (bounds[4] + bounds[5]) / 2])
+
+    def _overflow_points(self):
+        """
+        World points that must stay inside the frame: every vertex of the
+        visible isosurface lobes, plus the bounding-box corners of every other
+        visible actor (atoms, bonds, selection highlights, measurements).
+
+        Lobes use their actual vertices because a lobe's axis-aligned box can
+        reach well past its silhouette in oblique views; projecting the box
+        corners zoomed out about 20% further than needed for a diffuse orbital.
+        """
+        lobe_actors = [a for a in (self.pos_actor, self.neg_actor,
+                                   self.pos_wire_actor, self.neg_wire_actor) if a is not None]
+        chunks = [mesh.points for mesh, actor in ((self.pos_mesh, self.pos_actor),
+                                                  (self.neg_mesh, self.neg_actor))
+                  if mesh is not None and actor is not None
+                  and actor.GetVisibility() and mesh.n_points]
+
+        actors = self.plotter.renderer.GetActors()
+        actors.InitTraversal()
+        actor = actors.GetNextActor()
+        while actor is not None:
+            if actor.GetVisibility() and not any(actor is la for la in lobe_actors):
+                b = actor.GetBounds()
+                if b is not None and all(np.isfinite(b)) and b[1] >= b[0]:
+                    chunks.append(np.array([(x, y, z) for x in b[0:2]
+                                            for y in b[2:4] for z in b[4:6]]))
+            actor = actors.GetNextActor()
+        return np.vstack(chunks) if chunks else np.empty((0, 3))
+
     def _scene_overflow_zoom(self, margin=0.97):
         """
         Given the camera as currently set (orientation + distance already
         fixed by _fit_camera_to_atoms), compute how far to additionally zoom
-        out (<=1.0) so every visible actor — atoms, bonds, isosurface lobes,
-        wireframe overlay — stays within the frame. Since orbitals can extend
-        well past the atoms themselves, fitting to atoms alone can otherwise
-        clip the isosurface at the image edges.
+        out (<=1.0) so everything visible stays within the frame. Since
+        orbitals can extend well past the atoms themselves, fitting to atoms
+        alone can otherwise clip the isosurface at the image edges.
 
-        Projects the 8 corners of the full visible-actor bounding box through
-        the camera's world-to-viewport matrix; any corner landing outside
-        [-1, 1] means the scene overflows the frame. `margin` (<1) leaves a
-        small safety border so nothing sits exactly on the edge. Returns 1.0
-        (no change) if everything already fits.
+        Projects _overflow_points() through the camera's world-to-normalized-
+        device matrix (camera_utils.overflow_zoom). The aspect ratio is the
+        renderer's own (GetTiledAspectRatio), which stays correct for a
+        renderer that covers only part of the window. `margin` (<1) leaves a
+        small border. Returns 1.0 (no change) if everything already fits.
         """
         renderer = self.plotter.renderer
-        bounds = renderer.ComputeVisiblePropBounds()
-        if bounds is None or not all(np.isfinite(b) for b in bounds) or bounds[1] < bounds[0]:
+        points = self._overflow_points()
+        if len(points) == 0:
             return 1.0
-        xmin, xmax, ymin, ymax, zmin, zmax = bounds
-        corners = [(x, y, z)
-                   for x in (xmin, xmax) for y in (ymin, ymax) for z in (zmin, zmax)]
-
         cam = renderer.GetActiveCamera()
-        w, h = self.plotter.window_size
-        aspect = (w / h) if h else 1.0
         near, far = cam.GetClippingRange()
-        proj = cam.GetCompositeProjectionTransformMatrix(aspect, near, far)
-
-        max_ndc = 0.0
-        for x, y, z in corners:
-            cx, cy, cz, cw = proj.MultiplyPoint((x, y, z, 1.0))
-            if abs(cw) < 1e-12:
-                continue
-            max_ndc = max(max_ndc, abs(cx / cw), abs(cy / cw))
-
-        if max_ndc <= margin:
-            return 1.0
-        return margin / max_ndc
+        m = cam.GetCompositeProjectionTransformMatrix(renderer.GetTiledAspectRatio(), near, far)
+        proj = np.array([[m.GetElement(i, j) for j in range(4)] for i in range(4)])
+        return camera_utils.overflow_zoom(points, proj, margin)
 
     def _fit_camera_to_atoms(self, zoom=1.0, dynamic=False, margin=0.97):
         """
@@ -4479,7 +5150,11 @@ class MultiCubeVisualizer:
         save/export paths use this so nothing is clipped at the image edges,
         without zooming out further than necessary for compact orbitals.
         """
-        self.plotter.renderer.ResetCamera(self._atom_bounds())
+        bounds = self._atom_bounds()
+        if bounds is not None:
+            self.plotter.renderer.ResetCamera(bounds)
+        else:
+            self.plotter.renderer.ResetCamera()   # no atoms: frame whatever is visible
         if dynamic:
             self.plotter.render()
             zoom = min(zoom, self._scene_overflow_zoom(margin=margin))
@@ -4499,6 +5174,18 @@ class MultiCubeVisualizer:
         it just stops a lobe pointing toward the viewer from being clipped
         away (which otherwise makes the isosurface vanish as it rotates to
         face the camera).
+
+        ResetCameraClippingRange() alone cannot do this: geometry behind the
+        camera's position stays clipped however the near plane is set
+        (measured off-screen with VTK 9.6: a sphere 5 units behind the camera
+        rendered 0 pixels after a clipping-range reset).
+
+        The camera moves only along its view direction, so the orientation,
+        focal point and parallel scale are unchanged. It ends up at least
+        1.5x the scene diagonal from the focal point, and at least half a
+        diagonal in front of every corner of the scene's bounding box; the
+        second rule matters when the view has been panned so the focal point
+        lies outside the scene.
         """
         renderer = self.plotter.renderer
         bounds = renderer.ComputeVisiblePropBounds()
@@ -4513,83 +5200,189 @@ class MultiCubeVisualizer:
         pos   = np.array(cam.GetPosition())
         offset = pos - focal
         dist   = np.linalg.norm(offset)
-        min_dist = diag * 1.5
+        direction = offset / dist if dist > 1e-9 else np.array([0.0, 0.0, 1.0])
+        corners = np.array([(x, y, z) for x in (xmin, xmax)
+                            for y in (ymin, ymax) for z in (zmin, zmax)])
+        farthest_toward_camera = float(((corners - focal) @ direction).max())
+        min_dist = max(diag * 1.5, farthest_toward_camera + diag * 0.5)
         if dist < min_dist:
-            direction = offset / dist if dist > 1e-9 else np.array([0.0, 0.0, 1.0])
             cam.SetPosition(*(focal + direction * min_dist))
+
+    # ── Camera state (contract in camera_utils) ───────────────────────────────
+
+    def _restore_camera(self, state):
+        """Apply a camera-state dict, then recompute only the clipping range."""
+        camera_utils.apply_camera_state(self.plotter.renderer.GetActiveCamera(), state)
+        self.plotter.renderer.ResetCameraClippingRange()
+
+    @contextmanager
+    def _preserved_camera(self):
+        """
+        Run a temporary camera change (export framing) and put the live camera
+        back afterwards, zoom and projection included, even if it fails.
+        """
+        state = camera_utils.capture_camera_state(self.plotter.renderer.GetActiveCamera())
+        try:
+            yield
+        finally:
+            self._restore_camera(state)
+            self.plotter.render()
+
+    @contextmanager
+    def _export_overlays_hidden(self):
+        """
+        Hide the title, orientation axes and every visible 2D overlay for an
+        image capture, then restore them, even if the capture fails. Overlays
+        that were already hidden stay hidden.
+        """
+        renderer = self.plotter.renderer
+        if self.title_actor:
+            renderer.RemoveActor(self.title_actor)
+        self.plotter.hide_axes()
+        hidden = []
+        actors_2d = renderer.GetActors2D()
+        actors_2d.InitTraversal()
+        actor = actors_2d.GetNextActor2D()
+        while actor:
+            if actor.GetVisibility():
+                actor.VisibilityOff()
+                hidden.append(actor)
+            actor = actors_2d.GetNextActor2D()
+        try:
+            yield
+        finally:
+            for actor in hidden:
+                actor.VisibilityOn()
+            self._update_title()
+            self.plotter.show_axes()
+            renderer.GetRenderWindow().Render()
+
+    def _init_camera(self):
+        """
+        Startup viewpoint: look down +x, then turn 30° about the vertical and
+        tilt up 20°. Setting camera_position marks PyVista's camera as set, so
+        later add_mesh calls never reset it; that is why a viewer that starts
+        empty frames its first cube in switch_cube instead.
+        """
+        self.plotter.camera_position = "yz"
+        self.plotter.camera.azimuth   = 30
+        self.plotter.camera.elevation = 20
+        if self.cubes:
+            # Re-fit zoom to the molecule's atoms, not the isosurface that
+            # camera_position's implicit reset just fit to — otherwise the
+            # very first orbital's isosurface size sets the scale for the
+            # whole session (or, run standalone per cube file, for the export).
+            self._frame_initial_view()
+
+    def _frame_initial_view(self):
+        """
+        Fit the camera to the first molecule shown. It runs once per session:
+        at startup when cubes are given on the command line, otherwise when
+        the first cube is loaded from the GUI. Later loads and cube switches
+        keep the user's view; fit_view() refits on request.
+        """
+        self._fit_camera_to_atoms()
+        self._camera_framed = True
+
+    def fit_view(self):
+        """Camera panel 'Fit View': frame the molecule and its whole isosurface."""
+        if not self.cubes:
+            return
+        self._fit_camera_to_atoms(dynamic=True)
+        self.plotter.render()
 
     # ── Lobe rendering ────────────────────────────────────────────────────────
 
     def _add_lobe(self, mesh, color):
-        return self.plotter.add_mesh(
+        actor = self.plotter.add_mesh(
             mesh,
             color=color,
             opacity=self.surface_opacity,
             style='surface',
             smooth_shading=True,
-            specular=0.4, specular_power=20,
-            diffuse=0.85, ambient=0.15,
+            **self.render_style.material('lobe').kwargs(),
             show_scalar_bar=False,
         )
+        if is_open_surface(mesh):
+            # Seen through the cut, the inside of an open lobe is drawn in
+            # the same hue at 60 % brightness so it reads as an interior.
+            # Closed lobes keep no back-face property, so translucent ones
+            # look exactly as before.
+            back = vtk.vtkProperty()
+            back.DeepCopy(actor.GetProperty())
+            back.SetColor(*(0.6 * c for c in pv.Color(color).float_rgb))
+            actor.SetBackfaceProperty(back)
+        return actor
 
     def _add_wireframe_overlay(self, mesh):
-        grid_lines = build_uv_grid_lines(mesh)
-        if grid_lines.n_points == 0:
+        """
+        The v1.0.0 mesh overlay for one lobe (build_uv_grid_lines):
+        near-black, 0.8 px, 75 % opaque. The lines are unlit (VTK 9.6 drew
+        these normal-less lines the same either way) and lie exactly on the
+        surface, so they are pulled slightly toward the camera to win the
+        depth test instead of flickering in and out of the lobe.
+        """
+        lines = build_uv_grid_lines(mesh)
+        if lines.n_points == 0:
             return None
-        return self.plotter.add_mesh(
-            grid_lines,
+        actor = self.plotter.add_mesh(
+            pv.PolyData(lines.points, lines=lines.lines),     # geometry only, no scalars
             style='wireframe',
-            color=(0.08, 0.08, 0.08),
-            line_width=0.8,
+            color=MESH_LINE_COLOR,
+            line_width=MESH_LINE_WIDTH,
+            opacity=MESH_LINE_OPACITY,
             show_scalar_bar=False,
             render_lines_as_tubes=False,
-            opacity=0.75,
+            lighting=False,
         )
+        actor.GetMapper().SetRelativeCoincidentTopologyLineOffsetParameters(0, -4)
+        return actor
+
+    def _rebuild_mesh_overlay(self):
+        """Redo the overlay actors from the existing lobe meshes (no re-contouring)."""
+        for attr in ('pos_wire_actor', 'neg_wire_actor'):
+            actor = getattr(self, attr)
+            if actor is not None:
+                self.plotter.remove_actor(actor)
+                setattr(self, attr, None)
+        if self.show_wireframe:
+            self.pos_wire_actor = self._add_wireframe_overlay(self.pos_mesh)
+            self.neg_wire_actor = self._add_wireframe_overlay(self.neg_mesh)
 
     # ── Atoms ─────────────────────────────────────────────────────────────────
 
     def _add_atoms(self):
         """
-        Render all atoms as a single merged mesh with a per-point RGB color array.
-        One add_mesh call instead of N — dramatically faster for large systems.
+        Render all atoms as one mesh with a per-point RGB colour array, built
+        from a single cached unit sphere (see _sphere_mesh).
         """
         cube  = self.cubes[self.current_cube_index]
         mode  = self.MOLECULE_THEMES[self.current_mol_theme]['mode']
-        if mode == 'sticks':
+        if mode in ('sticks', 'tubes'):      # tube ends are part of the bond mesh
             return
         b2a = 0.529177 if cube['unit_bohr'] else 1.0
 
-        meshes = []
-        colors = []
-        RES = ATOM_SPHERE_RESOLUTION
-
+        centres, radii, colours = [], [], []
         for an, pos in zip(cube['atoms'], cube['coordinates']):
             e = self.ELEMENT_DATA.get(an)
             if not e:
                 continue
             symbol, vdw, cov, bs_r, color = e
-            r = (vdw if mode == 'space_filling' else bs_r) / b2a * self.atom_scale
-            sphere = pv.Sphere(radius=r, center=pos,
-                               theta_resolution=RES, phi_resolution=RES)
-            rgb = _hex_to_rgb255(color)
-            # Attach color to each sphere before merging so points are tagged
-            sphere.point_data['colors'] = np.full((sphere.n_points, 3),
-                                                   rgb, dtype=np.uint8)
-            meshes.append(sphere)
-
-        if not meshes:
+            centres.append(pos)
+            radii.append((vdw if mode == 'space_filling' else bs_r) / b2a * self.atom_scale)
+            colours.append(_hex_to_rgb255(color))
+        if not centres:
             return
-
-        # merge_points=False: keep every point as-is, no deduplication
-        combined = pv.merge(meshes, merge_points=False)
+        combined = _sphere_mesh(np.asarray(centres, dtype=float),
+                                np.asarray(radii, dtype=float),
+                                np.asarray(colours, dtype=np.uint8))
 
         actor = self.plotter.add_mesh(
             combined,
             scalars='colors',
             rgb=True,
             smooth_shading=True,
-            specular=0.5, specular_power=40,
-            diffuse=0.85, ambient=0.08,
+            **self.render_style.material('atom').kwargs(),
             show_scalar_bar=False,
         )
         self.atom_actors.append(actor)
@@ -4598,8 +5391,10 @@ class MultiCubeVisualizer:
 
     def _add_bonds(self):
         """
-        Render all bond cylinders as a single merged mesh with per-point colors.
-        One add_mesh call instead of 2xN — fast for large systems.
+        Render all half-bond cylinders as one mesh with per-point colours,
+        built from a single cached unit tube (see _tube_mesh). In Tubes mode
+        the mesh also holds a sphere of the tube radius on every atom, so the
+        rounded ends share the bonds' material exactly.
         """
         cube  = self.cubes[self.current_cube_index]
         theme = self.MOLECULE_THEMES[self.current_mol_theme]
@@ -4610,7 +5405,7 @@ class MultiCubeVisualizer:
         r    = brad / b2a * self.bond_scale
         mode = theme['mode']
 
-        meshes = []
+        starts, ends, colours = [], [], []
 
         for bond in cube['bonds']:
             e1 = self.ELEMENT_DATA.get(bond['an1'])
@@ -4619,7 +5414,7 @@ class MultiCubeVisualizer:
                 continue
             cov1, col1 = e1[2], e1[4]
             cov2, col2 = e2[2], e2[4]
-            frac = cov1 / (cov1 + cov2)
+            frac = 0.5 if mode == 'tubes' else cov1 / (cov1 + cov2)
             p1   = np.array(bond['c1']); p2 = np.array(bond['c2'])
             mid  = p1 + (p2 - p1) * frac
 
@@ -4637,22 +5432,34 @@ class MultiCubeVisualizer:
             for start, end, col in segs:
                 if np.linalg.norm(end - start) < 1e-6:
                     continue
-                tube = pv.Line(start, end).tube(
-                    radius=r, n_sides=BOND_TUBE_SIDES)
-                rgb  = _hex_to_rgb255(col)
-                tube.point_data['colors'] = np.full((tube.n_points, 3),
-                                                     rgb, dtype=np.uint8)
-                meshes.append(tube)
+                starts.append(start); ends.append(end)
+                colours.append(_hex_to_rgb255(col))
 
-        if not meshes:
+        ends_mesh = None
+        if mode == 'tubes':
+            centres, end_colours = [], []
+            for an, pos in zip(cube['atoms'], cube['coordinates']):
+                e = self.ELEMENT_DATA.get(an)
+                if e:
+                    centres.append(pos)
+                    end_colours.append(_hex_to_rgb255(e[4]))
+            if centres:
+                ends_mesh = _sphere_mesh(np.asarray(centres, dtype=float),
+                                         np.full(len(centres), r),
+                                         np.asarray(end_colours, dtype=np.uint8))
+
+        if not starts and ends_mesh is None:
             return
-
-        combined = pv.merge(meshes, merge_points=False)
+        combined = ends_mesh
+        if starts:
+            combined = _tube_mesh(np.asarray(starts, dtype=float), np.asarray(ends, dtype=float),
+                                  r, np.asarray(colours, dtype=np.uint8))
+            if ends_mesh is not None:
+                combined = _join_meshes(combined, ends_mesh)
         actor = self.plotter.add_mesh(
             combined, scalars='colors', rgb=True,
             smooth_shading=True,
-            specular=0.3, specular_power=20,
-            diffuse=0.9, ambient=0.08,
+            **self.render_style.material('bond').kwargs(),
             show_scalar_bar=False,
         )
         self.bond_actors.append(actor)
@@ -4661,62 +5468,24 @@ class MultiCubeVisualizer:
 
     def _add_atom_labels(self):
         """
-        Build all billboard label actors in parallel (ThreadPoolExecutor),
-        then add them to the renderer in one sequential pass on the main thread.
-
-        VTK actor construction is pure Python object work — no OpenGL calls —
-        so it is safe to do in worker threads.  Only AddActor() must stay on
-        the main thread (OpenGL context requirement).
+        One billboard label per atom, built on the main thread (VTK objects
+        are never created or changed from worker threads). Each label sits a
+        few pixels above its atom as drawn; _update_atom_label_offsets keeps
+        it there when atom size, representation, zoom or window size change.
         """
         cube     = self.cubes[self.current_cube_index]
         renderer = self.plotter.renderer
-        camera   = renderer.GetActiveCamera()
-        b2a      = 0.529177 if cube['unit_bohr'] else 1.0
-
-        fg        = (0.05, 0.05, 0.05) if self.background_color == 'white' else (1.0, 1.0, 1.0)
-        FONT_SIZE = 13
-        MARGIN_PX = 5
-        mode      = self.MOLECULE_THEMES[self.current_mol_theme]['mode']
-
-        # Snapshot camera-up once (thread-safe read)
-        up = np.array(camera.GetViewUp())
-        norm = np.linalg.norm(up)
-        up   = up / norm if norm > 1e-6 else np.array([0.0, 1.0, 0.0])
-
-        # Pre-compute world→display for ALL atoms using a single vtkCoordinate
-        # (must stay on main thread — VTK coordinate transform touches renderer)
-        coord = vtk.vtkCoordinate()
-        coord.SetCoordinateSystemToWorld()
-
-        def world_to_display(pt):
-            coord.SetValue(float(pt[0]), float(pt[1]), float(pt[2]))
-            return coord.GetComputedDisplayValue(renderer)
-
-        # Build per-atom parameter tuples (all main-thread, fast)
-        atom_params = []
+        fg       = self._label_color()
+        self._label_atom_indices = []
         for i, (an, pos) in enumerate(zip(cube['atoms'], cube['coordinates'])):
-            e      = self.ELEMENT_DATA.get(an)
+            e = self.ELEMENT_DATA.get(an)
             symbol = e[0] if e else f"X{an}"
-            vdw    = e[1] if e else 1.2
-            bs_r   = e[3] if e else 0.22
-            r_world = (vdw if mode == "space_filling" else bs_r) / b2a
-            centre_px = world_to_display(pos)
-            top_px    = world_to_display(np.array(pos) + up * r_world)
-            screen_r  = abs(top_px[1] - centre_px[1])
-            offset_y  = max(int(screen_r + MARGIN_PX), 8)
-            atom_params.append((i, symbol, tuple(pos), offset_y))
-
-        # Worker: construct one vtkBillboardTextActor3D (no OpenGL, thread-safe)
-        def build_actor(params):
-            i, symbol, pos, offset_y = params
-            label = f"{symbol}{i+1}"
             actor = vtk.vtkBillboardTextActor3D()
-            actor.SetInput(label)
+            actor.SetInput(f"{symbol}{i+1}")
             actor.SetPosition(*pos)
-            actor.SetDisplayOffset(0, offset_y)
             tp = actor.GetTextProperty()
             tp.SetFontFamilyToArial()
-            tp.SetFontSize(FONT_SIZE)
+            tp.SetFontSize(13)
             tp.SetBold(True)
             tp.SetItalic(False)
             tp.SetColor(*fg)
@@ -4724,19 +5493,59 @@ class MultiCubeVisualizer:
             tp.SetShadowOffset(1, -1)
             tp.SetJustificationToCentered()
             tp.SetVerticalJustificationToBottom()
-            return actor
-
-        # Build actors in parallel — results come back in submission order
-        # max(1, ...) — ThreadPoolExecutor rejects max_workers=0, which a
-        # cube carrying no atoms would otherwise produce.
-        n_workers = max(1, min(8, len(atom_params)))
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            actors = list(pool.map(build_actor, atom_params))
-
-        # Add to renderer on main thread (OpenGL)
-        for actor in actors:
             renderer.AddActor(actor)
             self.atom_label_actors.append(actor)
+            self._label_atom_indices.append(i)
+        self._update_atom_label_offsets(force=True)
+
+    def _rendered_atom_radius(self, atomic_number, b2a):
+        """Radius of the atom as drawn now, in cube units (sticks, tubes: the bond end)."""
+        theme = self.MOLECULE_THEMES[self.current_mol_theme]
+        if theme['mode'] in ('sticks', 'tubes'):
+            return theme['bond_radius_A'] * self.bond_scale / b2a
+        return self._atom_display_radius(atomic_number)
+
+    def _update_atom_label_offsets(self, force=False):
+        """
+        Raise each label LABEL_MARGIN_PX above its atom's rendered sphere, in
+        pixels at the current zoom. Runs at the start of every frame (render-
+        window observer) but only recomputes when something that changes the
+        spheres' on-screen size has changed: zoom or camera distance, window
+        size, atom size, bond size, representation or the shown cube.
+        """
+        if not self.atom_label_actors or not self.cubes:
+            return
+        renderer = self.plotter.renderer
+        cam = renderer.GetActiveCamera()
+        if cam.GetParallelProjection():
+            view = (round(cam.GetParallelScale(), 9),)
+        else:
+            view = (cam.GetPosition(), cam.GetFocalPoint(), cam.GetViewAngle())
+        key = (view, tuple(renderer.GetSize()), self.atom_scale, self.bond_scale,
+               self.current_mol_theme, self.current_cube_index, len(self.atom_label_actors))
+        if not force and key == self._label_offset_key:
+            return
+        self._label_offset_key = key
+        cube = self.cubes[self.current_cube_index]
+        b2a  = 0.529177 if cube['unit_bohr'] else 1.0
+        # Screen-vertical direction in world space: the view-up with its
+        # component along the view direction removed (VTK does not keep them
+        # perpendicular; the raw view-up made spheres measure ~6 % too small).
+        dop = np.array(cam.GetDirectionOfProjection(), dtype=float)
+        up = np.array(cam.GetViewUp(), dtype=float)
+        up = up - np.dot(up, dop) * dop
+        norm = np.linalg.norm(up)
+        up = up / norm if norm > 1e-9 else np.array([0.0, 1.0, 0.0])
+        coord = vtk.vtkCoordinate()
+        coord.SetCoordinateSystemToWorld()
+        for actor, i in zip(self.atom_label_actors, self._label_atom_indices):
+            pos = np.asarray(cube['coordinates'][i], dtype=float)
+            radius = self._rendered_atom_radius(cube['atoms'][i], b2a)
+            coord.SetValue(*pos)
+            centre_y = coord.GetComputedDoubleDisplayValue(renderer)[1]
+            coord.SetValue(*(pos + up * radius))
+            top_y = coord.GetComputedDoubleDisplayValue(renderer)[1]
+            actor.SetDisplayOffset(0, max(int(math.ceil(abs(top_y - centre_y) + LABEL_MARGIN_PX)), 8))
 
     # ── Title ─────────────────────────────────────────────────────────────────
 
@@ -4804,9 +5613,12 @@ class MultiCubeVisualizer:
         return None
 
     @staticmethod
-    def _population_summary_lines(target_index, entry):
+    def _population_summary_lines(target_index, entry, basis_label=None, basis_note=None):
         """Format one orbital's population breakdown for the viewport overlay."""
-        lines = [f"Orbital {target_index} Population"]
+        lines = [f"Orbital {target_index} Population"
+                 + (f" ({basis_label} basis)" if basis_label else "")]
+        if basis_note:
+            lines.append(basis_note)
         energy = entry.get("energy")
         occ = entry.get("occupation")
         if energy is not None:
@@ -4829,7 +5641,9 @@ class MultiCubeVisualizer:
         if found is None:
             return None
         target_index, entry = found
-        return "\n".join(self._population_summary_lines(target_index, entry))
+        return "\n".join(self._population_summary_lines(
+            target_index, entry, self.source_details.get("population_basis_label"),
+            self.source_details.get("population_basis_note")))
 
     def _update_population_overlay(self):
         if self.population_actor:
@@ -4883,11 +5697,54 @@ class MultiCubeVisualizer:
             self.plotter.remove_actor(a)
         self.selected_atom_highlights = []
 
+    @staticmethod
+    def _contour_lobes(grid, value, close=False):
+        """
+        The positive and negative isosurfaces at +/-value, both facing outward.
+
+        VTK's contour filter orients every surface toward decreasing values:
+        outward for the positive lobe but inward for the negative one (none
+        of its normals pointed outward when measured). Two-sided lighting
+        hides that, but back-face shading would paint the negative lobe's
+        outside as its inside, so flip it to match the positive lobe.
+
+        close=True first pads the grid with one layer of zeros, so a lobe
+        cut by the cube boundary comes out closed, with a flat face showing
+        where the box truncated it.
+        """
+        if close:
+            grid = pad_grid_with_zeros(grid)
+        pos = grid.contour([value])
+        neg = grid.contour([-value])
+        if neg.n_cells:
+            neg = neg.flip_faces()
+        return pos, neg
+
+    def _report_open_lobes(self):
+        """Warn in the status bar when an isosurface runs into the cube boundary."""
+        self.open_lobes = any(is_open_surface(m) for m in (self.pos_mesh, self.neg_mesh))
+        if self.main_window is None:
+            return
+        if self.open_lobes:
+            self.main_window.statusBar().showMessage(
+                "The isosurface reaches the edge of the cube grid and is cut open. "
+                "Raise the isovalue, use a larger grid margin, or turn on "
+                "'Close lobes at cube boundary' (Appearance).", 10000)
+        else:
+            self.main_window.statusBar().clearMessage()
+
+    def toggle_close_open_lobes(self, state):
+        self.close_open_lobes = bool(state)
+        if self.cubes:
+            self.update_visualization()
+            self.plotter.render()
+
     def update_visualization(self):
         self._clear_actors()
         grid          = self._create_grid()
-        self.pos_mesh = grid.contour([self.current_isovalue])
-        self.neg_mesh = grid.contour([-self.current_isovalue])
+        self.pos_mesh, self.neg_mesh = self._contour_lobes(
+            grid, self.current_isovalue, close=self.close_open_lobes)
+        self._report_open_lobes()
         self.pos_actor = self._add_lobe(self.pos_mesh, self.lobe_pos_color)
         self.neg_actor = self._add_lobe(self.neg_mesh, self.lobe_neg_color)
         if self.show_wireframe:
@@ -4910,7 +5767,7 @@ class MultiCubeVisualizer:
         if isinstance(value, str):
             try: value = float(value)
             except ValueError: return
-        max_val = max(c['data'].max() for c in self.cubes)
+        max_val = self._cubes_max()
         value   = float(np.clip(value, 1e-5, max_val))
         self.current_isovalue = value
         if self.isovalue_edit:
@@ -4927,8 +5784,9 @@ class MultiCubeVisualizer:
             a = getattr(self, attr)
             if a: self.plotter.remove_actor(a); setattr(self, attr, None)
         grid          = self._create_grid()
-        self.pos_mesh = grid.contour([value])
-        self.neg_mesh = grid.contour([-value])
+        self.pos_mesh, self.neg_mesh = self._contour_lobes(
+            grid, value, close=self.close_open_lobes)
+        self._report_open_lobes()
         self.pos_actor = self._add_lobe(self.pos_mesh, self.lobe_pos_color)
         self.neg_actor = self._add_lobe(self.neg_mesh, self.lobe_neg_color)
         if self.show_wireframe:
@@ -4944,13 +5802,193 @@ class MultiCubeVisualizer:
         self.refresh_metadata()
         self.plotter.render()
 
-    # ── Opacity ───────────────────────────────────────────────────────────────
+    # ── Appearance: state, widgets and handlers ───────────────────────────────
+    #
+    # The viewer's attributes are the single source of truth for appearance;
+    # appearance.AppearanceSettings is only a snapshot of them, for sessions
+    # and resets. Every change goes: update the attribute -> touch only the
+    # actors it affects -> sync the widgets under signal blockers -> render
+    # once. Syncing widgets never changes the scene.
+
+    def _appearance_settings(self):
+        """Snapshot of the current appearance."""
+        return appearance.AppearanceSettings(
+            representation=self.current_mol_theme,
+            atom_scale=self.atom_scale, bond_scale=self.bond_scale,
+            palette=self.lobe_palette,
+            positive_rgb=tuple(self.lobe_pos_color), negative_rgb=tuple(self.lobe_neg_color),
+            surface_opacity=self.surface_opacity, background=self.background_color,
+            close_open_lobes=self.close_open_lobes, show_mesh=self.show_wireframe,
+            show_atom_labels=self.show_atom_labels)
+
+    def _apply_appearance_settings(self, settings, rebuild=True):
+        """
+        Make `settings` the current appearance and show it in the panel.
+        rebuild=False only sets state and widgets (session loading rebuilds
+        the scene itself right after). Lighting and camera are not touched.
+        """
+        self._cancel_pending_appearance_updates()
+        s = settings
+        self.current_mol_theme = s.representation
+        self.atom_scale, self.bond_scale = s.atom_scale, s.bond_scale
+        self.lobe_palette = s.palette
+        self.lobe_pos_color, self.lobe_neg_color = tuple(s.positive_rgb), tuple(s.negative_rgb)
+        self.surface_opacity = s.surface_opacity
+        self.close_open_lobes = s.close_open_lobes
+        self.show_wireframe = s.show_mesh
+        self.show_atom_labels = s.show_atom_labels
+        self.background_color = s.background
+        if rebuild and self.plotter is not None:
+            self.plotter.set_background(self.background_color)
+            if self.cubes:
+                self.update_visualization()
+            else:
+                self.plotter.render()
+        self._sync_appearance_widgets()
+
+    def reset_appearance_defaults(self):
+        """Appearance back to defaults; camera, lighting, isovalue and data are kept."""
+        self._apply_appearance_settings(appearance.AppearanceSettings())
+
+    def _appearance_widget_list(self):
+        w = self._appearance_widgets
+        flat = []
+        for value in w.values():
+            flat.extend(value.values() if isinstance(value, dict) else [value])
+        return [x for x in flat if x is not None]
+
+    def _sync_appearance_widgets(self):
+        """Show the current appearance in every Appearance widget."""
+        w = self._appearance_widgets
+        if not w:
+            return
+        blockers = [QSignalBlocker(x) for x in self._appearance_widget_list()]
+        for name, button in w['representation'].items():
+            button.setChecked(name == self.current_mol_theme)
+        mode = self.MOLECULE_THEMES[self.current_mol_theme]['mode']
+        w['atom_slider'].setValue(int(round(self.atom_scale * 100)))
+        w['atom_value'].setText(f"{self.atom_scale:.2f}×")
+        w['bond_slider'].setValue(int(round(self.bond_scale * 100)))
+        w['bond_value'].setText(f"{self.bond_scale:.2f}×")
+        atoms_shown = mode not in ('sticks', 'tubes')
+        bonds_shown = self.MOLECULE_THEMES[self.current_mol_theme]['bond_radius_A'] > 0
+        no_atoms = f"{self.current_mol_theme} draws no atom spheres; Bond thickness sizes the ends"
+        for key, shown, why in (('atom', atoms_shown, no_atoms),
+                                ('bond', bonds_shown, "Space Filling draws no bonds")):
+            for part in (w[f'{key}_slider'], w[f'{key}_value'], w[f'{key}_label']):
+                part.setEnabled(shown)
+                part.setToolTip("" if shown else why)
+        combo = w['palette']
+        index = combo.findData(self.lobe_palette)
+        combo.setCurrentIndex(index if index >= 0 else combo.findData(appearance.CUSTOM_PALETTE))
+        for key, color in (('positive_swatch', self.lobe_pos_color),
+                           ('negative_swatch', self.lobe_neg_color)):
+            w[key].setStyleSheet(self._swatch_style(color))
+        w['opacity_slider'].setValue(int(round(self.surface_opacity * 100)))
+        w['opacity_value'].setText(f"{self.surface_opacity * 100:.0f} %")
+        w['mesh'].setChecked(self.show_wireframe)
+        w['close_lobes'].setChecked(self.close_open_lobes)
+        for color, button in w['background'].items():
+            button.setChecked(color == self.background_color)
+        w['labels'].setChecked(self.show_atom_labels)
+        w['population'].setChecked(self.show_population_info)
+        for blocker in blockers:
+            blocker.unblock()
+
+    @staticmethod
+    def _swatch_style(rgb):
+        r, g, b = (int(round(c * 255)) for c in rgb)
+        return (f"QPushButton {{ background:rgb({r},{g},{b}); border:2px solid #cdd6f4;"
+                f" border-radius:4px; min-width:44px; min-height:20px; }}"
+                f"QPushButton:focus {{ border:2px solid #89b4fa; }}")
+
+    # ── Molecule ──────────────────────────────────────────────────────────────
+
+    def set_molecule_theme(self, theme_name):
+        """
+        Switch the molecular representation. Only atom, bond and label
+        actors change; the orbital surfaces, isovalue and camera are untouched
+        (this used to rebuild and re-contour the whole scene).
+        """
+        self.current_mol_theme = theme_name
+        self._cancel_pending_appearance_updates()
+        self._rebuild_molecule()
+        self._sync_appearance_widgets()
+        self._update_title()
+        self.plotter.render()
+
+    def _rebuild_molecule(self, atoms=True, bonds=True):
+        """Rebuild the atom and/or bond meshes and re-place the labels."""
+        if not self.cubes:
+            return
+        if bonds:
+            for a in self.bond_actors:
+                self.plotter.remove_actor(a)
+            self.bond_actors = []
+            self._add_bonds()
+        if atoms:
+            for a in self.atom_actors:
+                self.plotter.remove_actor(a)
+            self.atom_actors = []
+            self._add_atoms()
+            self._update_selected_highlights()
+        self._update_atom_label_offsets(force=True)
+
+    def update_atom_scale(self, slider_value):
+        """Set the atom size (percent) and rebuild the atom mesh now."""
+        self.atom_scale = slider_value / 100.0
+        self._cancel_pending_appearance_updates()
+        self._rebuild_molecule(bonds=False)
+        self._sync_appearance_widgets()
+        self.plotter.render()
+
+    def update_bond_scale(self, slider_value):
+        """Set the bond thickness (percent) and rebuild the bond mesh now."""
+        self.bond_scale = slider_value / 100.0
+        self._cancel_pending_appearance_updates()
+        self._rebuild_molecule(atoms=False)
+        self._sync_appearance_widgets()
+        self.plotter.render()
+
+    def _on_size_slider(self, which, slider_value):
+        """
+        Slider drag: the value and its readout update at once; the mesh
+        rebuild is coalesced (APPEARANCE_DEBOUNCE_MS) and always uses the
+        latest value, so the final mesh matches where the slider stopped.
+        """
+        if which == 'atoms':
+            self.atom_scale = slider_value / 100.0
+            self._appearance_widgets['atom_value'].setText(f"{self.atom_scale:.2f}×")
+        else:
+            self.bond_scale = slider_value / 100.0
+            self._appearance_widgets['bond_value'].setText(f"{self.bond_scale:.2f}×")
+        self._pending_appearance_parts.add(which)
+        if self._appearance_timer is None:
+            self._appearance_timer = QTimer(self.main_window)
+            self._appearance_timer.setSingleShot(True)
+            self._appearance_timer.setInterval(APPEARANCE_DEBOUNCE_MS)
+            self._appearance_timer.timeout.connect(self._flush_appearance_updates)
+        self._appearance_timer.start()
+
+    def _flush_appearance_updates(self):
+        parts, self._pending_appearance_parts = self._pending_appearance_parts, set()
+        if parts and self.cubes:
+            self._rebuild_molecule(atoms='atoms' in parts, bonds='bonds' in parts)
+            self.plotter.render()
+
+    def _cancel_pending_appearance_updates(self):
+        """Drop queued slider rebuilds (new data, a session load or a direct change)."""
+        if self._appearance_timer is not None:
+            self._appearance_timer.stop()
+        self._pending_appearance_parts = set()
+
+    # ── Orbital surface ───────────────────────────────────────────────────────
 
     def update_opacity(self, slider_value):
         opacity = slider_value / 100.0
         self.surface_opacity = opacity
-        if self.opacity_label_value:
-            self.opacity_label_value.setText(f"{opacity:.2f}")
+        if self._appearance_widgets:
+            self._appearance_widgets['opacity_value'].setText(f"{opacity * 100:.0f} %")
         for actor in (self.pos_actor, self.neg_actor):
             if actor:
                 actor.GetProperty().SetOpacity(opacity)
@@ -4958,91 +5996,75 @@ class MultiCubeVisualizer:
         self._update_population_overlay()
         self.plotter.render()
 
-    # ── Atom / bond scale ────────────────────────────────────────────────────
+    def set_lobe_palette(self, palette_id):
+        """Apply a named phase palette. 'Custom' is reached by editing a colour."""
+        palette = appearance.PALETTES_BY_ID.get(palette_id)
+        if palette is None:
+            self._sync_appearance_widgets()
+            return
+        self._set_lobe_colors(palette.positive, palette.negative, palette.id)
 
-    def update_atom_scale(self, slider_value):
+    def _set_lobe_colors(self, positive, negative, palette_id=None):
         """
-        Rescale atom spheres in place (no isosurface/camera rebuild needed --
-        same lightweight redraw shape as set_lobe_colors). Bonds are
-        untouched, so only the atom (and highlight) actors are rebuilt.
+        Recolour the lobes in place (no re-contouring, no new actors). The
+        palette becomes the matching named one, or Custom.
         """
-        scale = slider_value / 100.0
-        self.atom_scale = scale
-        if self.atom_scale_label:
-            self.atom_scale_label.setText(f"{scale:.2f}x")
-
-        for a in self.atom_actors:
-            self.plotter.remove_actor(a)
-        self.atom_actors = []
-
-        self._add_atoms()
-        self._update_selected_highlights()
+        self.lobe_pos_color, self.lobe_neg_color = tuple(positive), tuple(negative)
+        self.lobe_palette = palette_id or appearance.palette_for_colors(positive, negative)
+        for actor, color in ((self.pos_actor, self.lobe_pos_color),
+                             (self.neg_actor, self.lobe_neg_color)):
+            if actor is None:
+                continue
+            actor.GetProperty().SetColor(*color)
+            back = actor.GetBackfaceProperty()
+            if back is not None:
+                back.SetColor(*(0.6 * c for c in color))
+        self._sync_appearance_widgets()
         self.plotter.render()
 
-    def update_bond_scale(self, slider_value):
-        """Rescale bond tubes in place; atoms are untouched."""
-        scale = slider_value / 100.0
-        self.bond_scale = scale
-        if self.bond_scale_label:
-            self.bond_scale_label.setText(f"{scale:.2f}x")
+    def _pick_lobe_color(self, sign):
+        """Colour dialog for one phase (sign '+' or '-'); no alpha, opacity has its own slider."""
+        current = self.lobe_pos_color if sign == '+' else self.lobe_neg_color
+        title = "Positive-phase (+) lobe colour" if sign == '+' else "Negative-phase (−) lobe colour"
+        chosen = QColorDialog.getColor(QColor.fromRgbF(*current), self.main_window, title)
+        if not chosen.isValid():
+            return
+        rgb = (chosen.redF(), chosen.greenF(), chosen.blueF())
+        if sign == '+':
+            self._set_lobe_colors(rgb, self.lobe_neg_color)
+        else:
+            self._set_lobe_colors(self.lobe_pos_color, rgb)
 
-        for a in self.bond_actors:
-            self.plotter.remove_actor(a)
-        self.bond_actors = []
+    def swap_lobe_colors(self):
+        """Swap the two display colours only; orbital phases and data are unchanged."""
+        self._set_lobe_colors(self.lobe_neg_color, self.lobe_pos_color)
 
-        self._add_bonds()
-        self.plotter.render()
-
-    # ── Callbacks ─────────────────────────────────────────────────────────────
-
-    def set_molecule_theme(self, theme_name):
-        self.current_mol_theme = theme_name
-        self.update_visualization()
-
-    def set_lobe_colors(self, scheme_name: str):
-        """Switch isosurface colour pair and redraw only the lobe actors."""
-        pos, neg = LOBE_COLOR_SCHEMES[scheme_name]
-        self.lobe_pos_color = pos
-        self.lobe_neg_color = neg
-
-        # Swap actors without rebuilding the whole scene
-        for attr in ('pos_actor', 'neg_actor', 'pos_wire_actor', 'neg_wire_actor'):
-            a = getattr(self, attr)
-            if a: self.plotter.remove_actor(a); setattr(self, attr, None)
-
-        if self.pos_mesh:
-            self.pos_actor = self._add_lobe(self.pos_mesh, self.lobe_pos_color)
-        if self.neg_mesh:
-            self.neg_actor = self._add_lobe(self.neg_mesh, self.lobe_neg_color)
-        if self.show_wireframe:
-            if self.pos_mesh:
-                self.pos_wire_actor = self._add_wireframe_overlay(self.pos_mesh)
-            if self.neg_mesh:
-                self.neg_wire_actor = self._add_wireframe_overlay(self.neg_mesh)
-        self._update_title()
-        self.plotter.render()
+    # ── Scene and annotations ─────────────────────────────────────────────────
 
     def set_background(self, color: str):
+        """
+        Set the 3D background (a scene setting saved in sessions; separate
+        from the Qt light/dark theme). Text and label colours follow it;
+        the lighting does not change.
+        """
         self.background_color = color
         self.plotter.set_background(color)
         self._update_title()
         self._update_population_overlay()
-        if self.show_atom_labels:
-            for a in self.atom_label_actors:
-                self.plotter.renderer.RemoveActor(a)
-            self.atom_label_actors = []
-            self._add_atom_labels()
+        fg = self._label_color()
+        for actor in self.atom_label_actors:
+            actor.GetTextProperty().SetColor(*fg)
+        self._sync_appearance_widgets()
         self.plotter.render()
 
+    def _label_color(self):
+        return (0.05, 0.05, 0.05) if self.background_color == 'white' else (1.0, 1.0, 1.0)
+
     def toggle_wireframe(self, state):
+        """Mesh overlay on or off; the lobes are not re-contoured."""
         self.show_wireframe = bool(state)
-        if self.pos_wire_actor:
-            self.plotter.remove_actor(self.pos_wire_actor); self.pos_wire_actor = None
-        if self.neg_wire_actor:
-            self.plotter.remove_actor(self.neg_wire_actor); self.neg_wire_actor = None
-        if self.show_wireframe and self.pos_mesh and self.neg_mesh:
-            self.pos_wire_actor = self._add_wireframe_overlay(self.pos_mesh)
-            self.neg_wire_actor = self._add_wireframe_overlay(self.neg_mesh)
+        self._rebuild_mesh_overlay()
+        self._sync_appearance_widgets()
         self._update_title(); self.plotter.render()
 
     def toggle_atom_labels(self, state):
@@ -5050,15 +6072,18 @@ class MultiCubeVisualizer:
         for a in self.atom_label_actors:
             self.plotter.renderer.RemoveActor(a)
         self.atom_label_actors = []
-        if self.show_atom_labels:
+        self._label_atom_indices = []
+        if self.show_atom_labels and self.cubes:
             self._add_atom_labels()
+        self._sync_appearance_widgets()
         self.plotter.render()
 
     def toggle_population_info(self, state):
         self.show_population_info = bool(state)
-        if self.show_population_info:
-            self._request_population_analysis()
+        if self.show_population_info and not self._request_population_analysis():
+            self.show_population_info = False      # basis question cancelled
         self._update_population_overlay()
+        self._sync_appearance_widgets()
         self.plotter.render()
 
     @staticmethod
@@ -5119,10 +6144,10 @@ class MultiCubeVisualizer:
             options.append((label, {"kind": "nbo_key", "key_path": key_file}))
         return options
 
-    def _prompt_population_basis(self, basis_options):
+    def _prompt_population_basis(self, basis_options, current=None):
         """
-        Ask which basis to analyse in.  Returns the chosen value, or None if
-        the user cancelled.
+        Ask which basis to analyse in, with `current` (a value) preselected.
+        Returns (label, value), or None if the user cancelled.
         """
         dlg = QDialog(self.main_window)
         dlg.setWindowTitle("Population Analysis Options")
@@ -5131,6 +6156,8 @@ class MultiCubeVisualizer:
         basis_combo = QComboBox()
         for label, value in basis_options:
             basis_combo.addItem(label, value)
+            if value == current:
+                basis_combo.setCurrentIndex(basis_combo.count() - 1)
         layout.addWidget(basis_combo)
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(dlg.accept)
@@ -5138,11 +6165,16 @@ class MultiCubeVisualizer:
         layout.addWidget(btns)
         if dlg.exec_() != QDialog.Accepted:
             return None
-        return basis_combo.currentData()
+        return basis_combo.currentText(), basis_combo.currentData()
 
-    def _start_population_thread(self, selected_basis):
+    def _start_population_thread(self, selected_basis, label="AO"):
         """Show the progress dialog and kick off the analysis worker."""
         self.source_details["_population_loading"] = True
+        self.source_details["population_analysis"] = None
+        self.source_details["population_basis"] = selected_basis
+        # "NAO (water.33)" -> "NAO" for the viewport overlay heading
+        self.source_details["population_basis_label"] = label.split(" (")[0]
+        self.source_details.pop("population_basis_note", None)
         self.refresh_metadata()
 
         self._population_progress = QProgressDialog(
@@ -5153,33 +6185,93 @@ class MultiCubeVisualizer:
         self._population_progress.setWindowModality(Qt.WindowModal)
         self._population_progress.show()
 
-        self._population_thread = _PopulationAnalysisThread(
+        self._population_target = self.source_details    # the result belongs here,
+        self._population_thread = _PopulationAnalysisThread(   # even after a cube switch
             self.source_details, selected_basis, self.main_window)
         self._population_thread.finished.connect(self._on_population_analysis_ready)
         self._population_thread.error.connect(self._on_population_analysis_error)
         self._population_thread.start()
 
     def _request_population_analysis(self):
-        if not self.source_details:
-            return
-        if self.source_details.get("population_analysis") is not None:
-            return
-        if self._population_thread is not None and self._population_thread.isRunning():
-            return
+        """
+        Make sure population analysis for the current cube's orbitals is
+        shown or on its way. Returns False only when the user cancelled the
+        basis question.
 
-        # Determine available basis options (NBO sources only)
+        NBO sources offer a basis choice (AO plus one per sibling key file),
+        asked every time population info is switched on, so an earlier
+        result is never shown without asking; the same basis as last time
+        reuses that result. Other sources have only the AO basis: an existing
+        result is reused and nothing is asked.
+        """
+        details = self.source_details
+        if not details:
+            return True
+        if self._population_thread is not None and self._population_thread.isRunning():
+            return True
+
         basis_options = [("AO (Atomic Orbital)", "AO")]
-        if str(self.source_details.get("source_type", "")).lower() == "nbo":
+        if str(details.get("source_type", "")).lower() == "nbo":
             basis_options.extend(self._nbo_basis_options())
 
-        # Only prompt when there is actually an alternative to AO
-        selected_basis = "AO"
-        if len(basis_options) > 1:
-            selected_basis = self._prompt_population_basis(basis_options)
-            if selected_basis is None:
-                return
+        if len(basis_options) == 1:
+            if details.get("population_analysis") is None:
+                self._start_population_thread("AO", "AO")
+            return True
 
-        self._start_population_thread(selected_basis)
+        chosen = self._prompt_population_basis(basis_options, details.get("population_basis"))
+        if chosen is None:
+            return False
+        self._population_choice = chosen
+        label, value = chosen
+        if value == details.get("population_basis") and details.get("population_analysis") is not None:
+            return True
+        self._start_population_thread(value, label)
+        return True
+
+    @staticmethod
+    def _basis_kind(label):
+        """'NAOs (water.33)' -> 'NAOs', 'AO (Atomic Orbital)' -> 'AO'."""
+        return label.split(" (")[0]
+
+    def _follow_population_to_current_cube(self):
+        """
+        Population info is on and the cube on screen may have changed: give
+        its orbitals an analysis as well, without asking again, in the basis
+        last chosen. NBO bases are matched by kind (e.g. 'NAOs'), since
+        another source has its own key files; the question is asked only when
+        that kind does not exist for this source. Orbitals from other sources
+        get the AO analysis, as when the box is ticked.
+        """
+        details = self.source_details
+        if not self.show_population_info or not details or details.get("_population_loading"):
+            return
+        if self._population_thread is not None and self._population_thread.isRunning():
+            return      # _on_population_analysis_ready calls back here
+        if str(details.get("source_type", "")).lower() != "nbo":
+            if details.get("population_analysis") is None:
+                self._start_population_thread("AO", "AO")
+            return
+        options = [("AO (Atomic Orbital)", "AO")] + self._nbo_basis_options()
+        match = None
+        if self._population_choice:
+            chosen_label, chosen_value = self._population_choice
+            # The very file chosen (same source), else the one option of the
+            # same kind; a kind several files share ('Key basis') is ambiguous.
+            match = next(((l, v) for l, v in options if v == chosen_value), None)
+            if match is None:
+                same_kind = [(l, v) for l, v in options
+                             if self._basis_kind(l) == self._basis_kind(chosen_label)]
+                match = same_kind[0] if len(same_kind) == 1 else None
+        if match is None:
+            if not self._request_population_analysis():
+                self.show_population_info = False      # question cancelled
+                self._sync_appearance_widgets()
+            return
+        label, value = match
+        if details.get("population_basis") == value and details.get("population_analysis") is not None:
+            return
+        self._start_population_thread(value, label)
 
     def _clear_population_progress(self):
         if self._population_progress is not None:
@@ -5189,20 +6281,48 @@ class MultiCubeVisualizer:
 
     def _on_population_analysis_ready(self, population):
         self._clear_population_progress()
-        if self.source_details is not None:
-            self.source_details.pop("_population_loading", None)
-            self.source_details["population_analysis"] = population
+        target = getattr(self, "_population_target", None) or self.source_details
+        fallback = (population or {}).get("basis_fallback")
+        if target is not None:
+            target.pop("_population_loading", None)
+            target["population_analysis"] = population
+            if fallback:
+                # The chosen file was not a usable basis: say what is shown.
+                target["population_basis_label"] = "AO"
+                target["population_basis_note"] = f"{fallback['requested']} could not be used"
+            else:
+                target.pop("population_basis_note", None)
         if self._population_thread is not None:
             self._population_thread.deleteLater()
             self._population_thread = None
+        # The cube may have changed while this ran; that one needs its own.
+        self._follow_population_to_current_cube()
         self.refresh_metadata()
         self._update_population_overlay()
         self.plotter.render()
+        if fallback:
+            self._warn_basis_fallback(fallback)
+
+    def _warn_basis_fallback(self, fallback):
+        """Non-blocking warning that the chosen basis file could not be used."""
+        if self.main_window is None:
+            return
+        box = QMessageBox(
+            QMessageBox.Warning, "Population Analysis",
+            f"{fallback['requested']} could not be used for the population analysis: "
+            f"{fallback['problem']}.\n\nThe population analysis shown is in the AO basis.",
+            QMessageBox.Ok, self.main_window)
+        box.setModal(False)
+        box.setAttribute(Qt.WA_DeleteOnClose)
+        box.show()
 
     def _on_population_analysis_error(self, msg):
         self._clear_population_progress()
-        if self.source_details is not None:
-            self.source_details.pop("_population_loading", None)
+        target = getattr(self, "_population_target", None) or self.source_details
+        if target is not None:
+            for key in ("_population_loading", "population_basis", "population_basis_label",
+                        "population_basis_note"):
+                target.pop(key, None)
         if self._population_thread is not None:
             self._population_thread.deleteLater()
             self._population_thread = None
@@ -5216,12 +6336,8 @@ class MultiCubeVisualizer:
 
     def switch_cube(self, index):
         # Snapshot the full camera state before rebuilding the scene
-        cam = self.plotter.renderer.GetActiveCamera()
-        saved_pos      = cam.GetPosition()
-        saved_focal    = cam.GetFocalPoint()
-        saved_viewup   = cam.GetViewUp()
-        saved_distance = cam.GetDistance()
-        saved_parallel = cam.GetParallelScale()
+        saved_camera = camera_utils.capture_camera_state(
+            self.plotter.renderer.GetActiveCamera())
 
         # Clear selection state fully before switching
         self.selected_atoms = []
@@ -5237,19 +6353,25 @@ class MultiCubeVisualizer:
         self._clear_measurement_actors()
 
         self.current_cube_index = index
+        details = self.cubes[index].get('source_details') if self.cubes else None
+        if details is not self.source_details:
+            self._set_source_details(details)
+        self._follow_population_to_current_cube()
         self.update_visualization()
+
+        # The first cube shown in an empty viewer has no view worth keeping
+        # (the startup camera was set before any actors existed), so frame it.
+        if not self._camera_framed:
+            self._frame_initial_view()
+            self.plotter.render()
+            return
 
         # Restore camera exactly — this keeps the same viewpoint (including
         # any manual zoom) regardless of where the new cube's atoms happen to
         # sit in world space. Saved images always re-fit to the atoms
         # separately at export time (see _fit_camera_to_atoms), so the live
         # interactive view here is left entirely under the user's control.
-        cam = self.plotter.renderer.GetActiveCamera()
-        cam.SetPosition(saved_pos)
-        cam.SetFocalPoint(saved_focal)
-        cam.SetViewUp(saved_viewup)
-        cam.SetDistance(saved_distance)
-        cam.SetParallelScale(saved_parallel)
+        camera_utils.apply_camera_state(self.plotter.renderer.GetActiveCamera(), saved_camera)
         # Under orthographic projection, distance doesn't affect apparent
         # size (only ParallelScale does) — so pushing the camera back if the
         # new cube's isosurface is bigger than the old one is "free": it
@@ -5335,7 +6457,8 @@ class MultiCubeVisualizer:
                              phi_resolution=ATOM_SPHERE_RESOLUTION)
             col  = ['yellow', 'orange', 'cyan', 'magenta'][i]
             a    = self.plotter.add_mesh(sph, color=col, opacity=0.55,
-                                         smooth_shading=True)
+                                         smooth_shading=True,
+                                         **self.render_style.material('highlight').kwargs())
             self.selected_atom_highlights.append(a)
 
     def _update_selection_label(self):
@@ -5402,20 +6525,215 @@ class MultiCubeVisualizer:
         self._clear_measurement_actors()
         self.plotter.render()
 
-    # ── SSAO ──────────────────────────────────────────────────────────────────
+    # ── Render style: lights, materials, depth peeling ───────────────────────
 
-    def toggle_ssao(self, state):
-        self.ssao_enabled = bool(state)
-        renderer = self.plotter.renderer
-        if self.ssao_enabled:
-            renderer.SetUseSSAO(True)
-            renderer.SetSSAORadius(0.5)
-            renderer.SetSSAOBias(0.01)
-            renderer.SetSSAOKernelSize(128)
-            renderer.SetSSAOBlur(True)
-        else:
-            renderer.SetUseSSAO(False)
+    def _configure_renderer(self):
+        """Apply self.render_style to the plotter (the plotter has no lights of its own)."""
+        rendering_style.apply_render_style(self.plotter, self.render_style)
+        rendering_style.install_auto_render_passes(self.plotter, lambda: self.render_style)
+        if self._label_observer is None:
+            self._label_observer = self.plotter.ren_win.AddObserver(
+                "StartEvent", lambda *_: self._update_atom_label_offsets())
+
+    def _set_render_style(self, style):
+        """
+        Make `style` current: lights and peeling on the renderer, the material
+        preset on every existing actor, and every lighting widget. Session
+        loading and preset changes go through here.
+        """
+        self.render_style = style
+        if style.preset != rendering_style.CUSTOM:
+            self._style_base_preset = style.preset
+        self._configure_renderer()
+        self._restyle_actors()
+        self._sync_style_widgets()
         self.plotter.render()
+
+    def _restyle_actors(self):
+        """Apply the current material preset to the actors already in the scene."""
+        groups = (('lobe', [self.pos_actor, self.neg_actor]),
+                  ('atom', self.atom_actors),
+                  ('bond', self.bond_actors),
+                  ('highlight', self.selected_atom_highlights))
+        for actor_class, actors in groups:
+            material = self.render_style.material(actor_class)
+            for actor in actors:
+                if actor is not None:
+                    rendering_style.apply_material(actor, material)
+
+    def _sync_style_widgets(self):
+        """Show self.render_style in the lighting widgets without triggering their handlers."""
+        if not self._light_preset_buttons:
+            return
+        style, light = self.render_style, self.render_style.lighting
+        widgets = list(self._light_preset_buttons.values()) + [self.rim_check, self.lock_check]
+        widgets += [w for pair in self._light_widgets.values() for w in pair if w is not None]
+        blockers = [QSignalBlocker(w) for w in widgets]
+        # Custom checks neither preset: the group must allow that for a moment.
+        self._light_preset_group.setExclusive(False)
+        for name, button in self._light_preset_buttons.items():
+            button.setChecked(name == style.preset)
+        self._light_preset_group.setExclusive(True)
+        custom = style.preset == rendering_style.CUSTOM
+        self._light_custom_label.setText(f"Custom (edited from {self._style_base_preset})")
+        self._light_custom_label.setVisible(custom)
+        for name, value in (('key_azimuth', light.key_azimuth),
+                            ('key_elevation', light.key_elevation),
+                            ('key_intensity', light.key_intensity),
+                            ('fill_ratio', light.fill_ratio * 100),
+                            ('headlight', light.headlight)):
+            slider, spin = self._light_widgets[name]
+            spin.setValue(value if isinstance(spin, QDoubleSpinBox) else int(round(value)))
+            if slider is not None:
+                slider.setValue(int(round(value)))
+        for name, (text, tip) in self.LIGHT_LABELS[light.layout].items():
+            self._light_labels[name].setText(text)
+            self._light_labels[name].setToolTip(tip)
+        self.rim_check.setEnabled(light.layout == 'kit')
+        self.rim_check.setToolTip("" if light.layout == 'kit'
+                                  else "Glossy's four-light layout has no rim lights")
+        self.rim_check.setChecked(light.rim_lights)
+        self.lock_check.setChecked(light.lock_to_camera)
+        for blocker in blockers:
+            blocker.unblock()
+
+    def _lighting_from_widgets(self):
+        """The current LightingSettings with the user-adjustable values read from the widgets."""
+        value = lambda name: self._light_widgets[name][1].value()
+        light = self.render_style.lighting
+        lock = self.lock_check.isChecked()
+        if lock:
+            frame = None
+        elif light.lock_to_camera or light.scene_frame is None:
+            # Released just now: freeze the lights where the camera has them,
+            # so the image does not jump.
+            frame = rendering_style.camera_frame(self.plotter.renderer.GetActiveCamera())
+        else:
+            frame = light.scene_frame
+        return dataclasses.replace(
+            light,
+            key_azimuth=float(value('key_azimuth')),
+            key_elevation=float(value('key_elevation')),
+            key_intensity=float(value('key_intensity')),
+            fill_ratio=float(value('fill_ratio')) / 100.0,
+            headlight=float(value('headlight')),
+            rim_lights=self.rim_check.isChecked(),
+            lock_to_camera=lock,
+            scene_frame=frame)
+
+    def _on_lighting_widget_changed(self, *_):
+        """Any manual lighting change makes the style Custom; the redraw is debounced."""
+        self.render_style = dataclasses.replace(
+            self.render_style, preset=rendering_style.CUSTOM,
+            lighting=self._lighting_from_widgets())
+        self._sync_style_widgets()
+        if self._lighting_timer is None:
+            self._lighting_timer = QTimer(self.main_window)
+            self._lighting_timer.setSingleShot(True)
+            self._lighting_timer.setInterval(30)
+            self._lighting_timer.timeout.connect(self._apply_lighting_now)
+        self._lighting_timer.start()
+
+    def _apply_lighting_now(self):
+        rendering_style.apply_lighting(self.plotter.renderer, self.render_style.lighting)
+        self.plotter.render()
+
+    def set_lighting_preset(self, name):
+        """Switch to a lighting preset (rendering_style.STYLE_PRESETS); edits are discarded."""
+        if name in rendering_style.STYLE_PRESETS and name != self.render_style.preset:
+            self._set_render_style(self.render_style.with_preset(name))
+
+    def _reset_lighting(self):
+        """Restore the preset the current settings started from."""
+        self._set_render_style(self.render_style.with_preset(self._style_base_preset))
+
+    LIGHTING_TIPS = {
+        rendering_style.DEFAULT_PRESET:
+            "The lights and surface materials of ChemInsight3D v1.0.0",
+        rendering_style.GLOSSY_PRESET:
+            "Bright, even lighting from four directions with strong white highlights",
+    }
+
+    # Lighting control labels per rig layout: name -> (label, tooltip).
+    LIGHT_LABELS = {
+        'kit': {
+            'key_azimuth': ("Key azimuth", "0° = from the viewer, positive = from the right"),
+            'key_elevation': ("Key elevation", "Positive = from above"),
+            'key_intensity': ("Key intensity", ""),
+            'fill_ratio': ("Fill", "Fill light as a percentage of the key; it sits opposite the key"),
+        },
+        'quad': {
+            'key_azimuth': ("Azimuth (±)", "The four lights sit this far left and right of the viewer"),
+            'key_elevation': ("Elevation (±)", "The four lights sit this far above and below the viewer"),
+            'key_intensity': ("Intensity", "Intensity of each upper light"),
+            'fill_ratio': ("Lower pair", "The two lower lights as a percentage of the upper pair"),
+        },
+    }
+
+    def _build_lighting_content(self, parent):
+        lay = QVBoxLayout(parent); lay.setContentsMargins(14,12,14,14); lay.setSpacing(8)
+        lay.addWidget(QLabel("<b>Lighting</b>"))
+        group = QButtonGroup(parent); group.setExclusive(True)
+        self._light_preset_buttons = {}
+        for name in rendering_style.STYLE_PRESETS:
+            button = QRadioButton(name)
+            button.setToolTip(self.LIGHTING_TIPS.get(name, ""))
+            button.toggled.connect(lambda on, n=name: on and self.set_lighting_preset(n))
+            group.addButton(button); lay.addWidget(button)
+            self._light_preset_buttons[name] = button
+        self._light_preset_group = group
+        self._light_custom_label = QLabel("")
+        self._light_custom_label.setToolTip("A control below was changed; Reset to Preset undoes it")
+        lay.addWidget(self._light_custom_label)
+
+        grid = QGridLayout(); grid.setHorizontalSpacing(6)
+        self._light_widgets = {}
+        self._light_labels = {}
+
+        def add_row(row, name, label, lo, hi, step, decimals, suffix, slider=True, tip=""):
+            lbl = QLabel(label); lbl.setToolTip(tip)
+            self._light_labels[name] = lbl
+            spin = QDoubleSpinBox() if decimals else QSpinBox()
+            if decimals:
+                spin.setDecimals(decimals)
+            spin.setRange(lo, hi); spin.setSingleStep(step); spin.setSuffix(suffix)
+            spin.setToolTip(tip)
+            sld = None
+            if slider:
+                sld = QSlider(Qt.Horizontal); sld.setRange(int(lo), int(hi)); sld.setToolTip(tip)
+                sld.valueChanged.connect(spin.setValue)
+                spin.valueChanged.connect(
+                    lambda v, s=sld: (s.blockSignals(True), s.setValue(int(round(v))),
+                                      s.blockSignals(False)))
+                grid.addWidget(sld, row, 1)
+            spin.valueChanged.connect(self._on_lighting_widget_changed)
+            grid.addWidget(lbl, row, 0)
+            grid.addWidget(spin, row, 2 if slider else 1, 1, 1 if slider else 2)
+            self._light_widgets[name] = (sld, spin)
+
+        add_row(0, 'key_azimuth', "Key azimuth", -180, 180, 5, 0, "°",
+                tip="0° = from the viewer, positive = from the right")
+        add_row(1, 'key_elevation', "Key elevation", -90, 90, 5, 0, "°",
+                tip="Positive = from above")
+        add_row(2, 'key_intensity', "Key intensity", 0.0, 1.5, 0.05, 2, "", slider=False)
+        add_row(3, 'fill_ratio', "Fill", 0, 100, 5, 0, " %",
+                tip="Fill light as a percentage of the key; it sits opposite the key")
+        add_row(4, 'headlight', "Headlight", 0.0, 0.5, 0.05, 2, "", slider=False,
+                tip="Light from the viewer's position")
+        lay.addLayout(grid)
+
+        self.rim_check = QCheckBox("Back / rim lights")
+        self.rim_check.toggled.connect(self._on_lighting_widget_changed)
+        lay.addWidget(self.rim_check)
+        self.lock_check = QCheckBox("Lock lights to camera")
+        self.lock_check.setToolTip(
+            "Off: lights stay fixed in the scene, so shading changes as the molecule turns")
+        self.lock_check.toggled.connect(self._on_lighting_widget_changed)
+        lay.addWidget(self.lock_check)
+        reset_btn = QPushButton("Reset to Preset")
+        reset_btn.clicked.connect(self._reset_lighting)
+        lay.addWidget(reset_btn)
+        self._sync_style_widgets()
 
     # ── Viewport measurement annotations ──────────────────────────────────────
 
@@ -5542,61 +6860,21 @@ class MultiCubeVisualizer:
         if not fname.lower().endswith(f".{fmt.lower()}"):
             fname += f".{fmt.lower()}"
 
-        # Saved images should always be at the molecule's true scale, regardless
-        # of whatever zoom the user has interactively set for inspection — snap
-        # to the atom-fit framing for the capture, then restore their live view.
-        cam     = self.plotter.renderer.GetActiveCamera()
-        sv_pos  = cam.GetPosition()
-        sv_foc  = cam.GetFocalPoint()
-        sv_up   = cam.GetViewUp()
-        sv_dist = cam.GetDistance()
-        sv_par  = cam.GetParallelScale()
-        self._fit_camera_to_atoms(dynamic=True)  # <- zoom out only as far as needed to fit
-
-        if self.title_actor:
-            self.plotter.renderer.RemoveActor(self.title_actor)
-        self.plotter.hide_axes()
-        try: self.plotter.remove_scalar_bar()
-        except Exception: pass
-        renderer  = self.plotter.renderer
-        actors_2d = renderer.GetActors2D()
-        actors_2d.InitTraversal()
-        hidden_2d = []
-        actor = actors_2d.GetNextActor2D()
-        while actor:
-            actor.VisibilityOff(); hidden_2d.append(actor)
-            actor = actors_2d.GetNextActor2D()
-
-        renderer.GetRenderWindow().Render()
-        # Use `scale=` (vtkWindowToImageFilter magnification) rather than
-        # `window_size=`, which actually resizes the embedded Qt render
-        # widget — since it's constrained by the surrounding layout, that
-        # resize can get clamped, leaving the molecule off-center in the
-        # captured buffer instead of centered at the higher resolution.
-        raw = self.plotter.screenshot(
-            return_img=True,
-            scale=scale,
-            transparent_background=transp,
-        )
-        img = Image.fromarray(raw)
-
-        for a in hidden_2d: a.VisibilityOn()
-        self._update_title()
-        self.plotter.show_axes()
-        cam.SetPosition(sv_pos); cam.SetFocalPoint(sv_foc); cam.SetViewUp(sv_up)
-        cam.SetDistance(sv_dist); cam.SetParallelScale(sv_par)
-        renderer.ResetCameraClippingRange()
-        renderer.GetRenderWindow().Render()
-
-        if fmt == "PNG":
-            img.save(fname, format="PNG", dpi=(300, 300))
-        elif fmt in ("PDF", "SVG"):
-            fig, ax = plt.subplots(
-                figsize=(img.width / 300, img.height / 300), dpi=300)
-            ax.imshow(img); ax.axis("off")
-            fig.savefig(fname, format=fmt.lower(),
-                        bbox_inches="tight", pad_inches=0, dpi=300)
-            plt.close(fig)
+        try:
+            img = Image.fromarray(self._render_export_image(scale, transp))
+            if fmt == "PNG":
+                img.save(fname, format="PNG", dpi=(300, 300))
+            elif fmt in ("PDF", "SVG"):
+                fig, ax = plt.subplots(
+                    figsize=(img.width / 300, img.height / 300), dpi=300)
+                ax.imshow(img); ax.axis("off")
+                fig.savefig(fname, format=fmt.lower(),
+                            bbox_inches="tight", pad_inches=0, dpi=300)
+                plt.close(fig)
+        except Exception as e:
+            QMessageBox.critical(self.main_window, "Save Error",
+                                 f"Could not save the image:\n{e}")
+            return
 
         size_mp = (img.width * img.height) / 1e6
         desc = " (transparent bg)" if transp else ""
@@ -5622,13 +6900,15 @@ class MultiCubeVisualizer:
             f.write(f" {sign*nz:5d}   0.000000   0.000000  {dz:12.6f}\n")
             for an, pos in zip(cube['atoms'], cube['coordinates']):
                 f.write(f" {an:5d}   0.000000  {pos[0]:12.6f}  {pos[1]:12.6f}  {pos[2]:12.6f}\n")
-            flat = cube['data'].flatten(order='F')
-            for i, v in enumerate(flat):
-                f.write(f"  {v:12.5e}")
-                if (i + 1) % 6 == 0:
-                    f.write("\n")
-            if len(flat) % 6 != 0:
-                f.write("\n")
+            # Cube files list values with x slowest and z fastest: C order of
+            # the (nx, ny, nz) grid. (Fortran order, used before, wrote the
+            # grid transposed, so saved results reopened scrambled.)
+            flat = np.asarray(cube['data']).ravel(order='C')
+            rows = len(flat) // 6
+            if rows:
+                np.savetxt(f, flat[:rows * 6].reshape(rows, 6), fmt="  %12.5e", delimiter="")
+            if len(flat) % 6:
+                np.savetxt(f, flat[rows * 6:].reshape(1, -1), fmt="  %12.5e", delimiter="")
 
     def open_diff_density_dialog(self):
         """Quick preset: ρ(A) − ρ(B) with diverging colormap annotation."""
@@ -5692,13 +6972,7 @@ class MultiCubeVisualizer:
             dlg.accept()
             if load_chk.isChecked():
                 # Append result to existing list — keep input cubes visible
-                idx = len(self.cube_files)
-                self.cube_files.append(path)
-                self.cubes.append(result)
-                if self.cube_list is not None:
-                    self.cube_list.blockSignals(True)
-                    self.cube_list.addItem(QListWidgetItem(os.path.basename(path)))
-                    self.cube_list.blockSignals(False)
+                idx = self._append_cube_to_list(path, result)
                 self.clear_selection()
                 if self.cube_list is not None:
                     self.cube_list.setCurrentRow(idx)
@@ -5776,31 +7050,41 @@ class MultiCubeVisualizer:
 
     # ── Feature 4: Camera presets ─────────────────────────────────────────────
 
+    # Direction from the molecule to the camera, and the view-up, per preset.
+    # 'Oblique' was labelled 'Perspective' in v1.0.0; the projection has always
+    # been orthographic, it is only an angled viewpoint.
+    CAMERA_PRESETS = {
+        'Front':   dict(direction=(0, -1, 0), up=(0, 0, 1)),
+        'Back':    dict(direction=(0, 1, 0),  up=(0, 0, 1)),
+        'Top':     dict(direction=(0, 0, 1),  up=(0, 1, 0)),
+        'Bottom':  dict(direction=(0, 0, -1), up=(0, 1, 0)),
+        'Left':    dict(direction=(-1, 0, 0), up=(0, 0, 1)),
+        'Right':   dict(direction=(1, 0, 0),  up=(0, 0, 1)),
+        'Oblique': dict(direction=(6, -8, 5), up=(0, 0, 1)),
+    }
+
     def set_camera_preset(self, preset):
-        views = {
-            'Front':       dict(position=(0,-10, 0), up=(0, 0, 1)),
-            'Back':        dict(position=(0, 10, 0), up=(0, 0, 1)),
-            'Top':         dict(position=(0, 0, 10), up=(0, 1, 0)),
-            'Bottom':      dict(position=(0, 0,-10), up=(0, 1, 0)),
-            'Left':        dict(position=(-10, 0, 0), up=(0, 0, 1)),
-            'Right':       dict(position=( 10, 0, 0), up=(0, 0, 1)),
-            'Perspective': dict(position=(6, -8, 5), up=(0, 0, 1)),
-        }
-        if preset not in views or not self.cubes:
+        """
+        Turn the camera to a standard orientation around the molecule centre.
+
+        Orientation only: the zoom (parallel scale) and projection are kept,
+        so switching views never changes how large the molecule looks. The
+        camera panel's 'Fit View' refits on request. The camera is then moved
+        back if needed so no part of the scene is behind it.
+        """
+        view = self.CAMERA_PRESETS.get(preset)
+        if view is None or not self.cubes:
             return
-        # Find centroid of molecule
-        cube     = self.cubes[self.current_cube_index]
-        centroid = cube['coordinates'].mean(axis=0) if len(cube['coordinates']) else np.zeros(3)
-        v        = views[preset]
-        pos_dir  = np.array(v['position'], dtype=float)
-        # Scale to a comfortable distance
-        extents  = np.ptp(cube['coordinates'], axis=0) if len(cube['coordinates']) else np.ones(3)*5
-        dist     = max(extents.max() * 2.5, 8.0)
-        pos_dir  = pos_dir / (np.linalg.norm(pos_dir) + 1e-9) * dist
+        center = self._molecule_center()
+        if center is None:
+            return
         cam = self.plotter.renderer.GetActiveCamera()
-        cam.SetFocalPoint(*centroid)
-        cam.SetPosition(*(centroid + pos_dir))
-        cam.SetViewUp(*v['up'])
+        direction = np.array(view['direction'], dtype=float)
+        direction /= np.linalg.norm(direction)
+        cam.SetFocalPoint(*center)
+        cam.SetPosition(*(center + direction * max(cam.GetDistance(), 1.0)))
+        cam.SetViewUp(*view['up'])
+        self._ensure_camera_clears_scene()
         self.plotter.renderer.ResetCameraClippingRange()
         self.plotter.render()
 
@@ -5871,24 +7155,9 @@ class MultiCubeVisualizer:
 
         return dlg, read_options, btns
 
-    @staticmethod
-    def _camera_state(cam):
-        """Snapshot the camera parameters this exporter sets and restores."""
-        return (cam.GetPosition(), cam.GetFocalPoint(), cam.GetViewUp(),
-                cam.GetDistance(), cam.GetParallelScale())
-
-    @staticmethod
-    def _restore_camera_state(cam, state):
-        position, focal_point, view_up, distance, parallel_scale = state
-        cam.SetPosition(position)
-        cam.SetFocalPoint(focal_point)
-        cam.SetViewUp(view_up)
-        cam.SetDistance(distance)
-        cam.SetParallelScale(parallel_scale)
-
     def _establish_export_camera(self, cam):
         """
-        Fix one viewpoint for the whole sequence and return its parameters.
+        Fix one viewpoint for the whole sequence and return its camera state.
 
         The viewpoint comes from the first frame's atom-fit, so every frame
         shares one scale instead of re-fitting (and potentially drifting)
@@ -5907,66 +7176,77 @@ class MultiCubeVisualizer:
         if worst_zoom != 1.0:
             cam.Zoom(worst_zoom)
             self.plotter.renderer.ResetCameraClippingRange()
-        return self._camera_state(cam)
+        return camera_utils.capture_camera_state(cam)
 
     def _capture_frame(self, scale, transparent):
         """
-        Screenshot the current cube with the UI overlays hidden, then put them
-        back.  Returns the raw RGB(A) array.
+        Screenshot the current cube at the current camera with the UI overlays
+        hidden, then put them back.  Returns the raw RGB(A) array.
+
+        Rendered at the final size in a separate off-screen plotter when
+        possible (no tile seams; labels and lines keep their 1x
+        proportions), otherwise by tiled magnification of the live window.
         """
-        if self.title_actor:
-            self.plotter.renderer.RemoveActor(self.title_actor)
-        self.plotter.hide_axes()
+        image = offscreen_export.render_full_size(
+            self.plotter, self.render_style, scale, transparent)
+        if image is not None:
+            return image
+        with self._export_overlays_hidden():
+            self.plotter.renderer.GetRenderWindow().Render()
+            # Use `scale=` (vtkWindowToImageFilter magnification) rather than
+            # `window_size=`, which actually resizes the embedded Qt render
+            # widget — since it's constrained by the surrounding layout, that
+            # resize can get clamped, leaving the molecule off-center in the
+            # captured buffer instead of centered at the higher resolution.
+            return self.plotter.screenshot(return_img=True, scale=scale,
+                                           transparent_background=transparent)
 
-        renderer = self.plotter.renderer
-        actors_2d = renderer.GetActors2D()
-        actors_2d.InitTraversal()
-        hidden = []
-        a = actors_2d.GetNextActor2D()
-        while a:
-            a.VisibilityOff()
-            hidden.append(a)
-            a = actors_2d.GetNextActor2D()
-        renderer.GetRenderWindow().Render()
-
-        # scale= (magnification) instead of window_size= — see save_image
-        raw = self.plotter.screenshot(return_img=True, scale=scale,
-                                      transparent_background=transparent)
-
-        for a in hidden:
-            a.VisibilityOn()
-        self._update_title()
-        self.plotter.show_axes()
-        renderer.GetRenderWindow().Render()
-        return raw
+    def _render_export_image(self, scale, transparent):
+        """
+        Capture the current cube for a saved image. Saved images always use
+        the molecule's true scale, whatever zoom the user has set for
+        inspection: fit to the atoms, zoom out only as far as the isosurface
+        needs, capture, then restore the live view (also on failure).
+        """
+        with self._preserved_camera():
+            self._fit_camera_to_atoms(dynamic=True)
+            return self._capture_frame(scale, transparent)
 
     def _write_image_sequence(self, options):
-        """Render and write one PNG per loaded cube; returns the paths written."""
+        """
+        Render and write one PNG per loaded cube; returns the paths written.
+
+        Every frame shares one camera (orientation and scale) from
+        _establish_export_camera. Per frame, only the camera's distance may
+        grow (_ensure_camera_clears_scene), so a larger orbital later in the
+        sequence is not cut by the near plane; apparent size is unchanged.
+        The selected cube and the live camera are restored afterwards, also
+        when a frame fails, and the error reports how many frames were saved.
+        """
         folder = options["folder"]
         orig_idx = self.current_cube_index
         cam = self.plotter.renderer.GetActiveCamera()
 
-        # Save the live camera so the interactive view can be restored once
-        # export finishes.
-        live_camera = self._camera_state(cam)
-        export_camera = self._establish_export_camera(cam)
-
         saved = []
-        for i in range(len(self.cubes)):
-            self.switch_cube(i)
-            self._restore_camera_state(cam, export_camera)
-            self.plotter.renderer.ResetCameraClippingRange()
-            self.plotter.render()
-            raw = self._capture_frame(options["scale"], options["transparent"])
-            out = os.path.join(folder, f"{options['prefix']}_{i+1:04d}.png")
-            Image.fromarray(raw).save(out, format="PNG", dpi=(300, 300))
-            saved.append(out)
-
-        self.switch_cube(orig_idx)
-        # Restore the live view the user had before exporting
-        self._restore_camera_state(cam, live_camera)
-        self.plotter.renderer.ResetCameraClippingRange()
-        self.plotter.render()
+        with self._preserved_camera():
+            try:
+                export_camera = self._establish_export_camera(cam)
+                for i in range(len(self.cubes)):
+                    self.switch_cube(i)
+                    camera_utils.apply_camera_state(cam, export_camera)
+                    self._ensure_camera_clears_scene()
+                    self.plotter.renderer.ResetCameraClippingRange()
+                    self.plotter.render()
+                    raw = self._capture_frame(options["scale"], options["transparent"])
+                    out = os.path.join(folder, f"{options['prefix']}_{i+1:04d}.png")
+                    Image.fromarray(raw).save(out, format="PNG", dpi=(300, 300))
+                    saved.append(out)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Export stopped after {len(saved)} of {len(self.cubes)} "
+                    f"image(s): {e}") from e
+            finally:
+                self.switch_cube(orig_idx)
         return saved
 
     def export_image_sequence(self):
@@ -5984,13 +7264,218 @@ class MultiCubeVisualizer:
                 QMessageBox.warning(dlg, "Error", "Folder does not exist.")
                 return
             dlg.accept()
-            saved = self._write_image_sequence(options)
+            try:
+                saved = self._write_image_sequence(options)
+            except Exception as e:
+                QMessageBox.critical(self.main_window, "Export Error", str(e))
+                return
             QMessageBox.information(
                 self.main_window, "Done",
                 f"Exported {len(saved)} image(s) to:\n{options['folder']}")
 
         btns.accepted.connect(do_export)
         dlg.exec_()
+
+    # ── Cube records and the disk-backed store ────────────────────────────────
+    #
+    # Every cube in self.cubes is a cube_store.CubeRecord: metadata in memory,
+    # grid in self.cube_store (an LRU of resident arrays backed by .npy cache
+    # files). Records have a stable 'id', a 'label', an optional 'source_path'
+    # and an 'unsaved' flag for computed grids not yet exported by the user.
+
+    def _make_record(self, cube, *, source_path=None, label=None, unsaved=False,
+                     source_details=None):
+        if isinstance(cube, cube_store.CubeRecord):
+            return cube
+        return cube_store.CubeRecord(self.cube_store, cube, source_path=source_path,
+                                     label=label, unsaved=unsaved,
+                                     source_details=source_details)
+
+    def _release_records(self, records):
+        """Give the grids of cubes leaving the list back to the store."""
+        for record in records:
+            if isinstance(record, cube_store.CubeRecord):
+                record.release()
+
+    @property
+    def _unsaved_cubes(self):
+        """{list index: record} for computed cubes the user has not exported yet."""
+        return {i: c for i, c in enumerate(self.cubes) if c.get('unsaved')}
+
+    def _cubes_max(self, default=0.1):
+        """Largest value over all cubes, from each record's cached statistics (no grid is paged in)."""
+        return max((c['data_max'] if 'data_max' in c else float(np.max(c['data']))
+                    for c in self.cubes), default=default)
+
+    def _unprotected_computed_cubes(self):
+        """Computed cubes that are neither exported nor part of a saved session."""
+        return [c for c in self.cubes if c.get('unsaved') and not c.get('session_asset')]
+
+    def _confirm_quit(self):
+        """Ask before quitting while computed cubes would be lost. True = quit."""
+        lost = self._unprotected_computed_cubes()
+        if not lost or self.main_window is None:
+            return True
+        answer = QMessageBox.question(
+            self.main_window, "Unsaved Computed Cubes",
+            f"{len(lost)} computed cube(s) are not saved as .cube files or in a saved "
+            "session and will be lost.\n\nQuit anyway?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        return answer == QMessageBox.Yes
+
+    def _shutdown_store(self):
+        try:
+            self.cube_store.close()
+        except Exception:
+            pass
+
+    # ── Sessions: cube list with durable assets ───────────────────────────────
+
+    @staticmethod
+    def _json_safe(value):
+        """source_details and cube metadata as plain JSON types."""
+        if isinstance(value, dict):
+            return {str(k): MultiCubeVisualizer._json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [MultiCubeVisualizer._json_safe(v) for v in value]
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        return value
+
+    def _session_cube_entries(self, session_path):
+        """
+        One entry per cube, in list order. Cubes backed by an existing .cube
+        file are stored by path. Computed (or no longer findable) cubes are
+        written as .npy grids into <session name>_assets/ beside the JSON and
+        stored by relative path with their metadata, so they come back
+        without recomputing. Grid files from earlier saves of this session
+        that are no longer used are removed.
+        """
+        session_dir = os.path.dirname(os.path.abspath(session_path))
+        assets_name = os.path.splitext(os.path.basename(session_path))[0] + "_assets"
+        assets_dir = os.path.join(session_dir, assets_name)
+        entries, written = [], set()
+        for i, rec in enumerate(self.cubes):
+            label = rec.get('label') or os.path.basename(self.cube_files[i])
+            path = rec.get('source_path')
+            if path and not rec.get('unsaved') and os.path.isfile(path):
+                entries.append({"kind": "file", "path": os.path.abspath(path), "label": label})
+                continue
+            os.makedirs(assets_dir, exist_ok=True)
+            grid_name = f"{rec['id']}.npy"
+            dest = os.path.join(assets_dir, grid_name)
+            src = self.cube_store.path(rec['grid_id'])
+            if os.path.abspath(src) != os.path.abspath(dest):
+                self.cube_store.export_grid(rec['grid_id'], dest)
+            written.add(grid_name)
+            meta = {k: rec.get(k) for k in ('origin', 'spacing', 'dimensions', 'atoms', 'coordinates',
+                                            'bonds', 'unit_bohr', 'data_min', 'data_max',
+                                            'source_details')}
+            entries.append({"kind": "grid", "grid": f"{assets_name}/{grid_name}", "label": label,
+                            "unsaved": bool(rec.get('unsaved')), "id": rec['id'],
+                            "meta": self._json_safe(meta)})
+        if os.path.isdir(assets_dir):
+            for name in os.listdir(assets_dir):
+                if name.endswith(".npy") and name not in written and len(name) == 36:
+                    try:
+                        os.remove(os.path.join(assets_dir, name))
+                    except OSError:
+                        pass
+        return entries
+
+    def _write_session(self, path):
+        """Write the session JSON (and its grid assets). Raises on failure."""
+        entries = self._session_cube_entries(path)
+        cam = self.plotter.renderer.GetActiveCamera()
+        state = {
+            'session_version': 2,
+            'cubes':           entries,
+            # Older readers (v1.0.0) only know file paths:
+            'cube_files':      [e['path'] for e in entries if e['kind'] == 'file'],
+            'current_index':   self.current_cube_index,
+            'isovalue':        self.current_isovalue,
+            **appearance.legacy_session_keys(self._appearance_settings()),   # read by v1.0.0
+            'appearance':      appearance.appearance_to_session(self._appearance_settings()),
+            'render_style':    self.render_style.to_dict(),
+            'camera': camera_utils.camera_state_to_session(
+                camera_utils.capture_camera_state(cam)),
+        }
+        tmp = f"{path}.tmp"
+        with open(tmp, 'w') as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, path)
+        session_dir = os.path.dirname(os.path.abspath(path))
+        for rec, entry in zip(self.cubes, entries):
+            if entry['kind'] == 'grid':
+                rec['session_asset'] = os.path.join(session_dir, entry['grid'])
+
+    def _restore_session_entries(self, session_path, entries):
+        """
+        Rebuild the cube list from a version-2 session. Returns the labels of
+        entries that could not be restored (missing or unreadable).
+        """
+        session_dir = os.path.dirname(os.path.abspath(session_path))
+        self._release_records(self.cubes)
+        self.cube_files, self.cubes = [], []
+        self.current_cube_index = 0
+        self._set_source_details(None)
+        if self.cube_list is not None:
+            self.cube_list.blockSignals(True)
+            self.cube_list.clear()
+        problems = []
+        for entry in entries if isinstance(entries, list) else []:
+            label = str(entry.get('label', '?')) if isinstance(entry, dict) else '?'
+            try:
+                if entry.get('kind') == 'file':
+                    path = entry['path']
+                    record = self._make_record(self.read_cube(path), source_path=path,
+                                               label=os.path.basename(path))
+                    shown = path
+                elif entry.get('kind') == 'grid':
+                    grid_path = os.path.join(session_dir, entry['grid'])
+                    record = self._record_from_asset(grid_path, entry)
+                    shown = label
+                else:
+                    raise ValueError("unknown entry")
+            except Exception as e:
+                problems.append(f"{label}: {e}")
+                continue
+            self.cubes.append(record)
+            self.cube_files.append(shown)
+            if self.cube_list is not None:
+                item = QListWidgetItem(label + ("  ●" if record.get('unsaved') else ""))
+                if record.get('unsaved'):
+                    item.setForeground(QBrush(QColor("#a6e3a1")))
+                self.cube_list.addItem(item)
+        if self.cube_list is not None:
+            self.cube_list.blockSignals(False)
+        return problems
+
+    def _record_from_asset(self, grid_path, entry):
+        """A cube record over a session's .npy grid (memory-mapped, never deleted)."""
+        meta = entry.get('meta') or {}
+        grid_id = self.cube_store.add_external(grid_path)
+        dims = tuple(int(n) for n in meta['dimensions'])
+        if tuple(self.cube_store.get(grid_id).shape) != dims:
+            self.cube_store.release(grid_id)
+            raise ValueError(f"grid shape does not match its metadata ({grid_path})")
+        cube = dict(origin=np.asarray(meta['origin'], dtype=float),
+                    spacing=tuple(float(x) for x in meta['spacing']), dimensions=dims,
+                    atoms=np.asarray(meta['atoms'], dtype=int),
+                    coordinates=np.asarray(meta['coordinates'], dtype=float).reshape(-1, 3),
+                    bonds=[{**b, 'c1': tuple(b['c1']), 'c2': tuple(b['c2'])}
+                           for b in meta.get('bonds') or []],
+                    unit_bohr=bool(meta['unit_bohr']),
+                    data_min=meta.get('data_min'), data_max=meta.get('data_max'),
+                    id=entry.get('id'))
+        record = cube_store.CubeRecord(self.cube_store, cube, label=entry.get('label'),
+                                       unsaved=entry.get('unsaved', True),
+                                       source_details=meta.get('source_details'),
+                                       grid_id=grid_id)
+        record['session_asset'] = grid_path
+        return record
 
     # ── Feature 9: Session save / restore ────────────────────────────────────
 
@@ -6005,7 +7490,8 @@ class MultiCubeVisualizer:
         _remember_dir(d)
         return d
 
-    def _append_cube_to_list(self, fname, cube, marker=None, color=None):
+    def _append_cube_to_list(self, fname, cube, marker=None, color=None, *,
+                             unsaved=False, source_details=None):
         """
         Append one cube to the viewer and its list widget.
 
@@ -6014,6 +7500,10 @@ class MultiCubeVisualizer:
         Returns the new index.
         """
         idx = len(self.cube_files)
+        is_file = not unsaved and os.path.isfile(fname)
+        cube = self._make_record(cube, source_path=os.path.abspath(fname) if is_file else None,
+                                 label=os.path.basename(fname) if is_file else fname,
+                                 unsaved=unsaved, source_details=source_details)
         self.cube_files.append(fname)
         self.cubes.append(cube)
         if self.cube_list is not None:
@@ -6033,13 +7523,15 @@ class MultiCubeVisualizer:
         else:
             self.switch_cube(idx)
 
-    def _replace_cubes_with(self, paths, clear_selection=False):
+    def _replace_cubes_with(self, paths, clear_selection=False, parsed=None):
         """
         Discard the loaded cubes and load *paths* in their place.
 
         A file that will not parse is reported and skipped rather than
-        aborting the rest of the load.
+        aborting the rest of the load. `parsed` optionally maps paths to cube
+        dicts already read (by the background loader).
         """
+        self._release_records(self.cubes)
         self.cube_files = []
         self.cubes = []
         self.current_cube_index = 0
@@ -6055,7 +7547,9 @@ class MultiCubeVisualizer:
         for fname in paths:
             fname = os.path.abspath(fname)
             try:
-                cube = self.read_cube(fname)
+                cube = parsed[fname] if parsed and fname in parsed else self.read_cube(fname)
+                if isinstance(cube, Exception):
+                    raise cube
             except Exception as e:
                 QMessageBox.warning(self.main_window, "Load Error",
                                     f"Could not load:\n{fname}\n\n{e}")
@@ -6077,7 +7571,36 @@ class MultiCubeVisualizer:
         _remember_dir(fnames[0] if fnames else "")
         if not fnames:
             return
-        self._replace_cubes_with(fnames, clear_selection=True)
+        self._load_cube_files_in_background(fnames)
+
+    def _load_cube_files_in_background(self, fnames):
+        """Parse and cache .cube files off the GUI thread, then replace the list.
+        Records already built by the worker are passed on; the GUI thread only
+        rebuilds the list and the scene."""
+        paths = [os.path.abspath(f) for f in fnames]
+        progress = QProgressDialog("Reading cube files…", None, 0, len(paths), self.main_window)
+        progress.setWindowTitle("Open Cube Files")
+        progress.setMinimumDuration(300)
+        progress.setValue(0)
+        def read_and_cache(path):     # runs in the worker: parse + write the cache file
+            return self._make_record(self.read_cube(path), source_path=path,
+                                     label=os.path.basename(path))
+
+        thread = _CubeFileLoadThread(paths, read_and_cache, parent=self.main_window)
+        parsed = {}
+
+        def on_file(i, fname, cube):
+            parsed[fname] = cube
+            progress.setValue(i + 1)
+
+        def on_done():
+            progress.close()
+            self._replace_cubes_with(paths, clear_selection=True, parsed=parsed)
+
+        thread.file_done.connect(on_file)
+        thread.finished.connect(on_done)
+        self._cube_load_thread = thread
+        thread.start()
 
     @staticmethod
     def _populate_source_table(table, paths):
@@ -6500,31 +8023,8 @@ class MultiCubeVisualizer:
         fname = _qd.selectedFiles()[0] if _qd.exec_() else ""
         _remember_dir(fname)
         if not fname: return
-        cam = self.plotter.renderer.GetActiveCamera()
-        state = {
-            'cube_files':      self.cube_files,
-            'current_index':   self.current_cube_index,
-            'isovalue':        self.current_isovalue,
-            'opacity':         self.surface_opacity,
-            'mol_theme':       self.current_mol_theme,
-            'atom_scale':      self.atom_scale,
-            'bond_scale':      self.bond_scale,
-            'background':      self.background_color,
-            'show_wireframe':  self.show_wireframe,
-            'show_labels':     self.show_atom_labels,
-            'ssao':            self.ssao_enabled,
-            'color_scheme':    self.color_scheme_combo.currentText()
-                               if self.color_scheme_combo else 'Crimson / Steel-blue (default)',
-            'camera': {
-                'position':  list(cam.GetPosition()),
-                'focal':     list(cam.GetFocalPoint()),
-                'viewup':    list(cam.GetViewUp()),
-                'distance':  cam.GetDistance(),
-            },
-        }
         try:
-            with open(fname, 'w') as f:
-                json.dump(state, f, indent=2)
+            self._write_session(fname)
             QMessageBox.information(self.main_window, "Session Saved",
                                     f"Session saved to:\n{fname}")
         except Exception as e:
@@ -6537,6 +8037,7 @@ class MultiCubeVisualizer:
         Unlike the interactive loaders this stays silent on a file that will
         not parse -- the session has already reported anything missing.
         """
+        self._release_records(self.cubes)
         self.cube_files = []
         self.cubes = []
         self.current_cube_index = 0
@@ -6546,7 +8047,8 @@ class MultiCubeVisualizer:
             self.cube_list.clear()
         for f in valid:
             try:
-                self.cubes.append(self.read_cube(f))
+                self.cubes.append(self._make_record(self.read_cube(f), source_path=os.path.abspath(f),
+                                                    label=os.path.basename(f)))
                 self.cube_files.append(f)
                 if self.cube_list is not None:
                     self.cube_list.addItem(QListWidgetItem(os.path.basename(f)))
@@ -6556,36 +8058,45 @@ class MultiCubeVisualizer:
             self.cube_list.blockSignals(False)
 
     def _apply_session_settings(self, state):
-        """Restore the scalar view settings and the lobe colour scheme."""
+        """
+        Restore the isovalue, the appearance (versioned block, or the flat
+        keys of older sessions) and the render style. Appearance widgets are
+        synced; the scene itself is rebuilt by the caller.
+        """
         self.current_isovalue = state.get('isovalue', 0.03)
-        self.surface_opacity = state.get('opacity', 1.0)
-        self.current_mol_theme = state.get('mol_theme', 'Ball and Stick')
-        self.atom_scale = state.get('atom_scale', 1.0)
-        self.bond_scale = state.get('bond_scale', 1.0)
-        self.background_color = state.get('background', 'black')
-        self.show_wireframe = state.get('show_wireframe', True)
-        self.show_atom_labels = state.get('show_labels', False)
-        self.ssao_enabled = state.get('ssao', False)
+        self._apply_appearance_settings(appearance.appearance_from_session(state), rebuild=False)
+        self._set_render_style(self._session_render_style(state))
 
-        scheme = state.get('color_scheme', 'Crimson / Steel-blue (default)')
-        if scheme == 'Mathematica (default)':   # name used by older sessions
-            scheme = 'Crimson / Steel-blue (default)'
-        if scheme in LOBE_COLOR_SCHEMES:
-            self.lobe_pos_color, self.lobe_neg_color = LOBE_COLOR_SCHEMES[scheme]
-            if self.color_scheme_combo:
-                self.color_scheme_combo.blockSignals(True)
-                self.color_scheme_combo.setCurrentText(scheme)
-                self.color_scheme_combo.blockSignals(False)
+    @staticmethod
+    def _session_render_style(state):
+        """
+        The render style a session asks for. Sessions from v1.0.0 have no
+        'render_style' block and get the default, which is how they rendered
+        then. Their 'ssao' flag is ignored: ambient occlusion was removed.
+        """
+        return rendering_style.RenderStyle.from_dict(state.get('render_style'))
 
     def _apply_session_camera(self, cam_state):
-        """Restore a saved camera position."""
+        """
+        Restore a session's saved camera.
+
+        - Current sessions: the full state, zoom and projection included.
+        - v1.0.0 sessions saved no zoom: the saved orientation is kept and the
+          zoom is refit to the molecule, instead of keeping whatever zoom the
+          viewer happened to have before loading.
+        - No camera block: the view is left as it is (as before).
+        - A malformed block is ignored with a warning instead of failing.
+        """
         if not cam_state:
             return
-        cam = self.plotter.renderer.GetActiveCamera()
-        cam.SetPosition(*cam_state['position'])
-        cam.SetFocalPoint(*cam_state['focal'])
-        cam.SetViewUp(*cam_state['viewup'])
-        cam.SetDistance(cam_state['distance'])
+        state = camera_utils.camera_state_from_session(cam_state)
+        if state is None:
+            print("Session camera settings are invalid; keeping the current view.")
+            return
+        camera_utils.apply_camera_state(self.plotter.renderer.GetActiveCamera(), state)
+        if state['parallel_scale'] is None:
+            self._fit_camera_to_atoms()
+        self._ensure_camera_clears_scene()
         self.plotter.renderer.ResetCameraClippingRange()
         self.plotter.render()
 
@@ -6605,34 +8116,54 @@ class MultiCubeVisualizer:
         except Exception as e:
             QMessageBox.critical(self.main_window, "Load Error", str(e))
             return
+        self._read_session(fname, state)
 
-        # Reload cube files
+    def _read_session(self, fname, state):
+        """Restore a parsed session (version 2 with assets, or a v1.0.0 file list)."""
+        if isinstance(state.get('cubes'), list):
+            problems = self._restore_session_entries(fname, state['cubes'])
+            if problems:
+                self._warn("Missing Cubes", "Some cubes could not be restored:\n" + "\n".join(problems))
+            if not self.cubes:
+                self._warn("No Cubes", "No cubes could be restored from this session.", critical=True)
+                return
+            self._finish_session_load(fname, state)
+            return
+
+        # Older sessions: cube file paths only
         saved_files = state.get('cube_files', [])
         valid = [f for f in saved_files if os.path.isfile(f)]
         missing = [f for f in saved_files if not os.path.isfile(f)]
         if missing:
-            QMessageBox.warning(self.main_window, "Missing Files",
-                                "Some cube files could not be found:\n" +
-                                "\n".join(os.path.basename(m) for m in missing))
+            self._warn("Missing Files", "Some cube files could not be found:\n" +
+                       "\n".join(os.path.basename(m) for m in missing))
         if not valid:
-            QMessageBox.critical(self.main_window, "No Files",
-                                 "No valid cube files found for this session.")
+            self._warn("No Files", "No valid cube files found for this session.", critical=True)
             return
 
         self._restore_session_cubes(valid)
-        self._apply_session_settings(state)
+        self._finish_session_load(fname, state)
 
-        # Rebuild scene
-        idx = min(state.get('current_index', 0), len(self.cubes) - 1)
-        self.plotter.set_background(self.background_color)
+    def _finish_session_load(self, fname, state):
+        self._apply_session_settings(state)
+        idx = max(0, min(int(state.get('current_index', 0) or 0), len(self.cubes) - 1))
+        self.set_background(self.background_color)
         self.switch_cube(idx)
         if self.cube_list is not None:
             self.cube_list.setCurrentRow(idx)
-
         self._apply_session_camera(state.get('camera', {}))
+        if self.main_window is not None:
+            QMessageBox.information(self.main_window, "Session Loaded",
+                                    f"Session restored from:\n{fname}")
 
-        QMessageBox.information(self.main_window, "Session Loaded",
-                                f"Session restored from:\n{fname}")
+    def _warn(self, title, text, critical=False):
+        """Message box in the app; printed when there is no window (tests, scripts)."""
+        if self.main_window is None:
+            print(f"{title}: {text}")
+        elif critical:
+            QMessageBox.critical(self.main_window, title, text)
+        else:
+            QMessageBox.warning(self.main_window, title, text)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # UI – Toolbar + dropdown panels + side panel
@@ -6666,104 +8197,200 @@ class MultiCubeVisualizer:
                 lay.addWidget(b)
 
     def _build_appearance_content(self, parent):
-        lay = QVBoxLayout(parent); lay.setContentsMargins(14,12,14,14); lay.setSpacing(10)
-        # Molecule theme
-        lay.addWidget(QLabel("<b>Molecular Representation</b>"))
-        self.mol_btn_group = QButtonGroup()
-        for tn in self.MOLECULE_THEMES:
-            rb = QRadioButton(tn); rb.setChecked(tn == self.current_mol_theme)
-            rb.toggled.connect(lambda chk, t=tn: chk and self.set_molecule_theme(t))
-            self.mol_btn_group.addButton(rb); lay.addWidget(rb)
-        lay.addWidget(self._separator())
-        lay.addWidget(QLabel("<b>Atom Size</b>"))
-        atom_scale_row = QHBoxLayout()
-        atom_scale_row.addWidget(QLabel("Small"))
-        self.atom_scale_slider = QSlider(Qt.Horizontal)
-        self.atom_scale_slider.setMinimum(25); self.atom_scale_slider.setMaximum(300)
-        self.atom_scale_slider.setValue(int(self.atom_scale * 100))
-        self.atom_scale_slider.valueChanged.connect(self.update_atom_scale)
-        atom_scale_row.addWidget(self.atom_scale_slider)
-        atom_scale_row.addWidget(QLabel("Large"))
-        lay.addLayout(atom_scale_row)
-        self.atom_scale_label = QLabel(f"{self.atom_scale:.2f}x")
-        self.atom_scale_label.setAlignment(Qt.AlignCenter)
-        lay.addWidget(self.atom_scale_label)
+        """
+        Appearance panel: Molecule / Orbital Surface / Scene & Annotations,
+        in a scroll area so it fits short windows. Every widget is kept in
+        self._appearance_widgets so _sync_appearance_widgets can show the
+        current state after loads, resets and programmatic changes.
+        """
+        outer = QVBoxLayout(parent); outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # The body needs the dropdown's own background: inside a scroll area it
+        # otherwise gets Qt's default light palette under the panel's light text.
+        scroll.setStyleSheet("QScrollArea { background:transparent; border:none; }"
+                             "QWidget#appearanceBody { background:#2a2a3e; }")
+        body = QWidget(); body.setObjectName("appearanceBody")
+        scroll.setWidget(body)
+        outer.addWidget(scroll)
+        parent._scroll_body = body           # _position_dropdown sizes the panel from this
 
-        lay.addWidget(QLabel("<b>Bond Size</b>"))
-        bond_scale_row = QHBoxLayout()
-        bond_scale_row.addWidget(QLabel("Thin"))
-        self.bond_scale_slider = QSlider(Qt.Horizontal)
-        self.bond_scale_slider.setMinimum(25); self.bond_scale_slider.setMaximum(300)
-        self.bond_scale_slider.setValue(int(self.bond_scale * 100))
-        self.bond_scale_slider.valueChanged.connect(self.update_bond_scale)
-        bond_scale_row.addWidget(self.bond_scale_slider)
-        bond_scale_row.addWidget(QLabel("Thick"))
-        lay.addLayout(bond_scale_row)
-        self.bond_scale_label = QLabel(f"{self.bond_scale:.2f}x")
-        self.bond_scale_label.setAlignment(Qt.AlignCenter)
-        lay.addWidget(self.bond_scale_label)
+        lay = QVBoxLayout(body); lay.setContentsMargins(14, 12, 14, 14); lay.setSpacing(8)
+        w = {}
+        SEGMENT = ("QPushButton { padding:4px 6px; }"
+                   "QPushButton:checked { background:#89b4fa; color:#1e1e2e; font-weight:bold; }")
+
+        def section(title):
+            label = QLabel(f"<b>{title}</b>")
+            label.setStyleSheet("color:#89b4fa; font-size:10pt; padding-top:4px;")
+            lay.addWidget(label)
+
+        def segmented(options, handler, tip="", columns=None):
+            """Exclusive buttons in one row, or in rows of `columns`."""
+            row = QGridLayout(); row.setSpacing(4)
+            columns = columns or len(options)
+            group = QButtonGroup(body); group.setExclusive(True)
+            buttons = {}
+            for i, (value, text) in enumerate(options):
+                b = QPushButton(text); b.setCheckable(True); b.setStyleSheet(SEGMENT)
+                b.setToolTip(tip)
+                b.clicked.connect(lambda _, v=value: handler(v))
+                group.addButton(b); row.addWidget(b, i // columns, i % columns)
+                buttons[value] = b
+            lay.addLayout(row)
+            return buttons, group
+
+        def slider_row(grid, row, label, lo, hi, handler, tip):
+            name = QLabel(label); name.setToolTip(tip)
+            slider = QSlider(Qt.Horizontal); slider.setRange(lo, hi); slider.setToolTip(tip)
+            slider.setAccessibleName(label)
+            slider.valueChanged.connect(handler)
+            value = QLabel(""); value.setMinimumWidth(44)
+            value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            grid.addWidget(name, row, 0); grid.addWidget(slider, row, 1); grid.addWidget(value, row, 2)
+            return name, slider, value
+
+        # ── Molecule ──
+        section("Molecule")
+        w['representation'], self._representation_group = segmented(
+            [("Ball and Stick", "Ball && Stick"), ("Sticks", "Sticks"), ("Tubes", "Tubes"),
+             ("Space Filling", "Space Fill")],
+            self.set_molecule_theme, "Molecular representation", columns=2)
+        grid = QGridLayout(); grid.setHorizontalSpacing(8)
+        w['atom_label'], w['atom_slider'], w['atom_value'] = slider_row(
+            grid, 0, "Atom size", 25, 300, lambda v: self._on_size_slider('atoms', v),
+            "Atom sphere size relative to the default")
+        w['bond_label'], w['bond_slider'], w['bond_value'] = slider_row(
+            grid, 1, "Bond thickness", 25, 300, lambda v: self._on_size_slider('bonds', v),
+            "Bond tube thickness relative to the default")
+        lay.addLayout(grid)
         lay.addWidget(self._separator())
-        lay.addWidget(QLabel("<b>Isosurface Colors</b>"))
-        self.color_scheme_combo = QComboBox()
-        for n in LOBE_COLOR_SCHEMES: self.color_scheme_combo.addItem(n)
-        self.color_scheme_combo.currentTextChanged.connect(self.set_lobe_colors)
-        lay.addWidget(self.color_scheme_combo)
+
+        # ── Orbital surface ──
+        section("Orbital Surface")
+        palette_row = QHBoxLayout()
+        palette_row.addWidget(QLabel("Phase colours"))
+        combo = QComboBox()
+        combo.setToolTip("Colours of the positive (+) and negative (−) orbital phases. "
+                         "These are phase signs, not electric charge.")
+        for p in appearance.PALETTES:
+            combo.addItem(self._palette_icon(p.positive, p.negative), p.label, p.id)
+        combo.addItem(appearance.CUSTOM_LABEL, appearance.CUSTOM_PALETTE)
+        combo.activated.connect(lambda i: self.set_lobe_palette(combo.itemData(i)))
+        palette_row.addWidget(combo, 1)
+        lay.addLayout(palette_row)
+        w['palette'] = combo
+        self.color_scheme_combo = combo
+
+        swatch_row = QHBoxLayout(); swatch_row.setSpacing(6)
+        for key, sign, text, name in (('positive_swatch', '+', "+", "Positive (+)"),
+                                      ('negative_swatch', '-', "−", "Negative (−)")):
+            sign_label = QLabel(f"<b>{text}</b>"); sign_label.setToolTip(f"{name} phase")
+            swatch_row.addWidget(sign_label)
+            b = QPushButton("")
+            b.setToolTip(f"Choose the {name.lower()} phase colour")
+            b.setAccessibleName(f"{name} phase colour")
+            b.clicked.connect(lambda _, s=sign: self._pick_lobe_color(s))
+            swatch_row.addWidget(b)
+            w[key] = b
+        swap = QPushButton("⇄ Swap")
+        swap.setToolTip("Swap the two phase colours (display only; the orbital is unchanged)")
+        swap.setAccessibleName("Swap phase colours")
+        swap.clicked.connect(self.swap_lobe_colors)
+        swatch_row.addWidget(swap); swatch_row.addStretch()
+        lay.addLayout(swatch_row)
+
+        grid = QGridLayout(); grid.setHorizontalSpacing(8)
+        _, w['opacity_slider'], w['opacity_value'] = slider_row(
+            grid, 0, "Surface opacity", 10, 100, self.update_opacity,
+            "Opacity of both orbital lobes")
+        lay.addLayout(grid)
+        self.opacity_slider = w['opacity_slider']
+
+        w['mesh'] = QCheckBox("Mesh overlay on lobes")
+        w['mesh'].setToolTip("Grid lines on the lobes that show their shape")
+        w['mesh'].toggled.connect(self.toggle_wireframe)
+        lay.addWidget(w['mesh'])
+
+        advanced_btn = QToolButton()
+        advanced_btn.setText("Advanced surface options")
+        advanced_btn.setCheckable(True)
+        advanced_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        advanced_btn.setArrowType(Qt.RightArrow)
+        advanced_btn.setStyleSheet("QToolButton { color:#cdd6f4; border:none; }")
+        advanced = QWidget()
+        adv_lay = QVBoxLayout(advanced); adv_lay.setContentsMargins(18, 0, 0, 0)
+        w['close_lobes'] = QCheckBox("Close lobes at cube boundary")
+        w['close_lobes'].setToolTip(
+            "Pads the grid with one layer of zeros before contouring, so a lobe "
+            "cut by the edge of the cube grid gets a flat face where the box "
+            "truncated it instead of an opening. The orbital values are unchanged.")
+        w['close_lobes'].toggled.connect(self.toggle_close_open_lobes)
+        adv_lay.addWidget(w['close_lobes'])
+        advanced.setVisible(False)
+
+        def toggle_advanced(checked):
+            advanced.setVisible(checked)
+            advanced_btn.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+            self._fit_dropdown_height(parent)
+
+        advanced_btn.toggled.connect(toggle_advanced)
+        lay.addWidget(advanced_btn)
+        lay.addWidget(advanced)
         lay.addWidget(self._separator())
-        lay.addWidget(QLabel("<b>Opacity</b>"))
-        op_row = QHBoxLayout()
-        op_row.addWidget(QLabel("Low"))
-        self.opacity_slider = QSlider(Qt.Horizontal)
-        self.opacity_slider.setMinimum(10); self.opacity_slider.setMaximum(100)
-        self.opacity_slider.setValue(int(self.surface_opacity*100))
-        self.opacity_slider.valueChanged.connect(self.update_opacity)
-        op_row.addWidget(self.opacity_slider)
-        op_row.addWidget(QLabel("High"))
-        lay.addLayout(op_row)
-        self.opacity_label_value = QLabel(f"{self.surface_opacity:.2f}")
-        self.opacity_label_value.setAlignment(Qt.AlignCenter)
-        lay.addWidget(self.opacity_label_value)
+
+        # ── Scene & annotations ──
+        section("Scene &amp; Annotations")
+        bg_row = QHBoxLayout(); bg_row.addWidget(QLabel("Background"))
+        lay.addLayout(bg_row)
+        w['background'], self._background_group = segmented(
+            [("black", "Black"), ("white", "White")], self.set_background,
+            "3D scene background (saved with sessions; separate from the interface theme)")
+        w['labels'] = QCheckBox("Show atom labels")
+        w['labels'].toggled.connect(self.toggle_atom_labels)
+        lay.addWidget(w['labels'])
+        w['population'] = QCheckBox("Show population info")
+        w['population'].setToolTip("Per-atom population analysis for the current orbital "
+                                   "(computed in the background when first shown)")
+        w['population'].toggled.connect(self.toggle_population_info)
+        lay.addWidget(w['population'])
         lay.addWidget(self._separator())
-        lay.addWidget(QLabel("<b>Background & Lighting</b>"))
-        self.bg_btn_group = QButtonGroup()
-        for lbl, col in [("Black","black"),("White","white")]:
-            rb = QRadioButton(lbl); rb.setChecked(col==self.background_color)
-            rb.toggled.connect(lambda chk,c=col: chk and self.set_background(c))
-            self.bg_btn_group.addButton(rb); lay.addWidget(rb)
-        ssao = QCheckBox("Ambient Occlusion (SSAO)")
-        ssao.setChecked(self.ssao_enabled); ssao.stateChanged.connect(self.toggle_ssao)
-        lay.addWidget(ssao)
-        lay.addWidget(self._separator())
-        wf = QCheckBox("Mesh Overlay on Lobes")
-        wf.setChecked(self.show_wireframe); wf.stateChanged.connect(self.toggle_wireframe)
-        lay.addWidget(wf)
-        lbl = QCheckBox("Show Atom Labels")
-        lbl.setChecked(self.show_atom_labels); lbl.stateChanged.connect(self.toggle_atom_labels)
-        lay.addWidget(lbl)
-        pop_lbl = QCheckBox("Show Population Info")
-        pop_lbl.setChecked(self.show_population_info)
-        pop_lbl.stateChanged.connect(self.toggle_population_info)
-        lay.addWidget(pop_lbl)
-        lay.addWidget(self._separator())
-        lay.addWidget(QLabel("<b>Custom Lobe Colors</b>"))
-        col_btn = QPushButton("🎨  Open Color Editor…")
-        col_btn.setMinimumHeight(30)
-        col_btn.clicked.connect(self.open_color_editor)
-        lay.addWidget(col_btn)
-        lay.addWidget(self._separator())
-        theme_btn = QPushButton("☀  Toggle Light / Dark Theme")
-        theme_btn.setMinimumHeight(30)
-        theme_btn.clicked.connect(self.toggle_ui_theme)
-        lay.addWidget(theme_btn)
+
+        reset = QPushButton("Restore Appearance Defaults")
+        reset.setToolTip("Reset these settings only; camera, lighting and data are kept")
+        reset.clicked.connect(self.reset_appearance_defaults)
+        lay.addWidget(reset)
+        lay.addStretch()
+
+        self._appearance_widgets = w
+        self._sync_appearance_widgets()
+
+    @staticmethod
+    def _palette_icon(positive, negative):
+        """A small two-colour icon for a palette entry."""
+        pixmap = QPixmap(28, 14)
+        painter = QPainter(pixmap)
+        painter.fillRect(0, 0, 14, 14, QColor.fromRgbF(*positive))
+        painter.fillRect(14, 0, 14, 14, QColor.fromRgbF(*negative))
+        painter.end()
+        return QIcon(pixmap)
 
     def _build_camera_content(self, parent):
         lay = QVBoxLayout(parent); lay.setContentsMargins(14,12,14,14); lay.setSpacing(10)
         lay.addWidget(QLabel("<b>Standard Views</b>"))
         grid = QGridLayout()
-        presets = ['Front','Back','Top','Bottom','Left','Right','Perspective']
-        for i, p in enumerate(presets):
+        for i, p in enumerate(self.CAMERA_PRESETS):
             btn = QPushButton(p); btn.setFixedHeight(30)
+            btn.setToolTip("Turn to this view; the zoom is kept")
             btn.clicked.connect(lambda _, pr=p: self.set_camera_preset(pr))
             grid.addWidget(btn, i//4, i%4)
+        fit_btn = QPushButton("Fit View"); fit_btn.setFixedHeight(30)
+        fit_btn.setToolTip("Frame the molecule and the whole isosurface "
+                           "(the framing saved images use)")
+        fit_btn.clicked.connect(self.fit_view)
+        grid.addWidget(fit_btn, len(self.CAMERA_PRESETS)//4, len(self.CAMERA_PRESETS)%4)
         lay.addLayout(grid)
 
     def _build_measure_content(self, parent):
@@ -6886,6 +8513,15 @@ class MultiCubeVisualizer:
         mw = self.main_window.width()
         if local.x() + panel.width() > mw:
             panel.move(mw - panel.width(), local.y())
+        self._fit_dropdown_height(panel)
+
+    def _fit_dropdown_height(self, panel):
+        """A panel with a scroll body: as tall as its content, never past the window."""
+        body = getattr(panel, '_scroll_body', None)
+        if body is None or self.main_window is None:
+            return
+        available = max(200, self.main_window.height() - panel.y() - 12)
+        panel.setFixedHeight(min(body.sizeHint().height() + 4, available))
 
     def _close_all_dropdowns(self):
         for info in self._dropdowns.values():
@@ -6955,7 +8591,7 @@ class MultiCubeVisualizer:
         iso_frame = QFrame()
         iso_frame.setStyleSheet("QFrame{background:#181825;border:1px solid #313244;border-radius:4px;}")
         iso_lay = QVBoxLayout(iso_frame); iso_lay.setContentsMargins(6,6,6,6); iso_lay.setSpacing(4)
-        max_val = max((c['data'].max() for c in self.cubes), default=0.1)
+        max_val = self._cubes_max(default=0.1)
         max_val = max(max_val, 0.001)
         self.isovalue_slider = QSlider(Qt.Horizontal)
         self.isovalue_slider.setMinimum(1)
@@ -7002,7 +8638,8 @@ class MultiCubeVisualizer:
 
         MENUS = [
             ("  Files",      "files",      self._build_files_content,      250),
-            ("  Appearance", "appearance", self._build_appearance_content, 340),
+            ("  Appearance", "appearance", self._build_appearance_content, 380),
+            ("  Lighting",   "lighting",   self._build_lighting_content,   330),
             ("  Camera",     "camera",     self._build_camera_content,     310),
             ("  Measure",    "measure",    self._build_measure_content,    370),
             ("  Analysis",   "analysis",   self._build_analysis_content,   290),
@@ -7058,6 +8695,17 @@ class MultiCubeVisualizer:
             btn.clicked.connect(
                 lambda checked, k=key, b=btn: self._toggle_dropdown(k, None, b))
             tb.addWidget(btn)
+
+        # Interface theme: an application preference, not a scene setting.
+        spacer = QWidget(); spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        tb.addWidget(spacer)
+        theme_btn = QPushButton("☀  Theme", self.main_window)
+        theme_btn.setStyleSheet(BTN_STYLE)
+        theme_btn.setFixedHeight(40)
+        theme_btn.setToolTip("Switch the interface between dark and light "
+                             "(the 3D background is set in Appearance)")
+        theme_btn.clicked.connect(self.toggle_ui_theme)
+        tb.addWidget(theme_btn)
 
         # ── Side dock panel ───────────────────────────────────────────────────
         side = self._build_side_panel()
@@ -7181,6 +8829,10 @@ class MultiCubeVisualizer:
             item.setText(base)
             item.setForeground(QBrush(QColor("#cdd6f4")))
         self.cube_files[cube_idx] = out_path
+        record = self.cubes[cube_idx]
+        record['unsaved'] = False
+        record['source_path'] = os.path.abspath(out_path)
+        record['label'] = base
         if self.cube_list is not None and self.cube_list.item(cube_idx) is not None:
             self.cube_list.blockSignals(True)
             self.cube_list.item(cube_idx).setText(base)
@@ -7191,12 +8843,10 @@ class MultiCubeVisualizer:
         """
         Write one cube to *folder*.
 
-        An in-memory cube is written from its stored result dict; one already
+        An unsaved computed cube is written from its cached grid; one already
         on disk is copied.  Returns an error string, or None on success.
         """
         import shutil
-
-        import nbo_read as _nr
 
         fname = self.cube_files[cube_idx]
         # Derive a safe filename (strip unsaved marker if present)
@@ -7207,7 +8857,9 @@ class MultiCubeVisualizer:
 
         try:
             if cube_idx in unsaved:
-                _nr.write_cube_from_result(unsaved[cube_idx], out_path)
+                # Written from the cached grid (paged in only for the write).
+                self._write_cube(self.cubes[cube_idx], out_path,
+                                 comment=f"ChemInsight3D: {self.cube_files[cube_idx]}")
                 del unsaved[cube_idx]
                 self._mark_cube_saved(lw, cube_idx, base, out_path)
             else:
@@ -7309,57 +8961,62 @@ class MultiCubeVisualizer:
 
     def _clear_computed_cubes(self):
         """
-        Drop every cube produced by a previous computation, so the list always
-        reflects the current basis/key file.
-
-        Indices are removed highest-first so earlier ones stay valid, and
-        signals are blocked throughout: otherwise each takeItem() fires
-        currentRowChanged and switch_cube() rebuilds the whole scene for every
-        remaining old cube, visibly "loading" the previous file's orbitals
-        before the new ones are added.
+        Remove every unsaved computed cube (only when the user chose to
+        replace them). Indices go highest-first so earlier ones stay valid,
+        with list signals blocked so no intermediate scene is rebuilt.
         """
+        doomed = sorted(self._unsaved_cubes, reverse=True)
         if self.cube_list is not None:
             self.cube_list.blockSignals(True)
-        for idx in sorted(self._unsaved_cubes.keys(), reverse=True):
-            if idx < len(self.cubes):
-                del self.cubes[idx]
-                del self.cube_files[idx]
+        for idx in doomed:
+            self._release_records([self.cubes[idx]])
+            del self.cubes[idx]
+            del self.cube_files[idx]
             if self.cube_list is not None and self.cube_list.item(idx) is not None:
                 self.cube_list.takeItem(idx)
         if self.cube_list is not None:
             self.cube_list.blockSignals(False)
-        self._unsaved_cubes = {}
-
-        # Reset selection to last remaining cube (if any)
         if self.cube_list is not None and self.cube_list.count() > 0:
             self.current_cube_index = max(0, self.cube_list.count() - 1)
             self.cube_list.setCurrentRow(self.current_cube_index)
         elif not self.cubes:
             self.current_cube_index = 0
 
+    def _keep_previous_results(self):
+        """
+        A new computation finished while unsaved computed cubes are listed:
+        keep them (default) or replace them. Never decided silently against
+        the user: without a window (scripts, tests) they are kept.
+        """
+        if not self._unsaved_cubes or self.main_window is None:
+            return True
+        box = QMessageBox(self.main_window)
+        box.setWindowTitle("Previous Results")
+        box.setText(f"{len(self._unsaved_cubes)} computed cube(s) from earlier are not saved.")
+        box.setInformativeText("Keep them in the list, or replace them with the new results?")
+        keep = box.addButton("Keep", QMessageBox.AcceptRole)
+        box.addButton("Replace", QMessageBox.DestructiveRole)
+        box.setDefaultButton(keep)
+        box.exec_()
+        return box.clickedButton() is keep
+
     def _load_computed_cubes(self, results):
         """
-        Receive a list of in-memory result dicts from _ComputeThread and load
-        them directly into the visualizer without writing any files to disk.
-
-        Any cubes that were previously loaded from an NBO computation are
-        cleared first, so the list always reflects the current basis/key file.
+        Receive in-memory result dicts from a compute thread and add them to
+        the list as unsaved cubes. Each grid moves to the disk-backed store;
+        the result dicts (and their arrays) are not kept, so a computed grid
+        is in RAM only while it is among the recently used ones.
         """
-        if not hasattr(self, '_unsaved_cubes'):
-            self._unsaved_cubes = {}
-        self._set_source_details(None)
-        if results:
-            self._set_source_details(results[0].get("source_details"))
-
-        self._clear_computed_cubes()
+        if results and not self._keep_previous_results():
+            self._clear_computed_cubes()
 
         first_new_idx = None
         for r in results:
             try:
                 cube = self._result_to_cube(r)
                 idx = self._append_cube_to_list(
-                    r['label'], cube, marker="  ●", color="#a6e3a1")
-                self._unsaved_cubes[idx] = r   # keep result dict for saving
+                    r['label'], cube, marker="  ●", color="#a6e3a1",
+                    unsaved=True, source_details=r.get("source_details"))
                 if first_new_idx is None:
                     first_new_idx = idx
             except Exception as e:
@@ -7370,6 +9027,8 @@ class MultiCubeVisualizer:
                     + traceback.format_exc())
 
         if first_new_idx is not None:
+            # Set explicitly: selecting a row that is already current emits nothing.
+            self._set_source_details(self.cubes[first_new_idx].get('source_details'))
             self._select_cube(first_new_idx)
 
     def _result_to_cube(self, r):
@@ -7492,111 +9151,18 @@ class MultiCubeVisualizer:
         cam_r.SetParallelScale(cam_l.GetParallelScale())
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # FEATURE: Color editor for lobes
-    # ═══════════════════════════════════════════════════════════════════════════
-
-    def open_color_editor(self):
-        """Let the user pick arbitrary colors for positive and negative lobes."""
-        dlg  = QDialog(self.main_window)
-        dlg.setWindowTitle("Lobe Color Editor")
-        dlg.setMinimumWidth(300)
-        dlg.setStyleSheet(
-            f"QDialog{{background:{self._theme['app_bg']};color:{self._theme['text']};}}"
-            f"QLabel{{color:{self._theme['text']};}}"
-            f"QPushButton{{background:{self._theme['panel_bg']};color:{self._theme['text']};"
-            f"border:1px solid {self._theme['border2']};border-radius:4px;padding:5px 10px;}}"
-            f"QPushButton:hover{{background:{self._theme['border2']};}}"
-        )
-        lay  = QVBoxLayout(dlg)
-        lay.addWidget(QLabel("Click a swatch to choose a color:"))
-
-        def _rgb_to_hex(rgb_01):
-            return '#{:02x}{:02x}{:02x}'.format(
-                int(rgb_01[0]*255), int(rgb_01[1]*255), int(rgb_01[2]*255))
-
-        def _hex_to_rgb01(h):
-            h = h.lstrip('#')
-            return (int(h[0:2],16)/255, int(h[2:4],16)/255, int(h[4:6],16)/255)
-
-        self._editor_pos_hex = _rgb_to_hex(self.lobe_pos_color)
-        self._editor_neg_hex = _rgb_to_hex(self.lobe_neg_color)
-
-        def make_swatch(label_text, get_hex, set_hex_fn, btn_ref):
-            row = QHBoxLayout()
-            lbl = QLabel(label_text); lbl.setFixedWidth(110)
-            btn = QPushButton()
-            btn.setFixedSize(80, 28)
-            btn.setStyleSheet(
-                f"background:{get_hex()};border:2px solid #fff;border-radius:4px;")
-            def pick(b=btn, gf=get_hex, sf=set_hex_fn):
-                init = QColor(gf())
-                col  = QColorDialog.getColor(init, dlg, "Choose color",
-                                              QColorDialog.ShowAlphaChannel)
-                if col.isValid():
-                    hex_val = col.name()
-                    sf(hex_val)
-                    btn.setStyleSheet(
-                        f"background:{hex_val};border:2px solid #fff;border-radius:4px;")
-                    self._apply_lobe_colors_from_editor()
-            btn.clicked.connect(pick)
-            row.addWidget(lbl); row.addWidget(btn)
-            return row, btn
-
-        row_p, _ = make_swatch(
-            "Positive lobe:",
-            lambda: self._editor_pos_hex,
-            lambda h: setattr(self, '_editor_pos_hex', h),
-            None)
-        row_n, _ = make_swatch(
-            "Negative lobe:",
-            lambda: self._editor_neg_hex,
-            lambda h: setattr(self, '_editor_neg_hex', h),
-            None)
-        lay.addLayout(row_p)
-        lay.addLayout(row_n)
-
-        tip = QLabel("Tip: selecting a preset in Appearance will override custom colors.")
-        tip.setStyleSheet(f"color:{self._theme['muted']};font-size:9pt;")
-        lay.addWidget(tip)
-
-        btns = QDialogButtonBox(QDialogButtonBox.Close)
-        btns.rejected.connect(dlg.reject)
-        lay.addWidget(btns)
-        dlg.exec_()
-
-    def _apply_lobe_colors_from_editor(self):
-        def h2r(h):
-            h = h.lstrip('#')
-            return (int(h[0:2],16)/255, int(h[2:4],16)/255, int(h[4:6],16)/255)
-        self.lobe_pos_color = h2r(self._editor_pos_hex)
-        self.lobe_neg_color = h2r(self._editor_neg_hex)
-        # Swap lobe actors without full scene rebuild
-        for attr in ('pos_actor','neg_actor','pos_wire_actor','neg_wire_actor'):
-            a = getattr(self, attr)
-            if a: self.plotter.remove_actor(a); setattr(self, attr, None)
-        if self.pos_mesh:
-            self.pos_actor = self._add_lobe(self.pos_mesh, self.lobe_pos_color)
-        if self.neg_mesh:
-            self.neg_actor = self._add_lobe(self.neg_mesh, self.lobe_neg_color)
-        if self.show_wireframe:
-            if self.pos_mesh:
-                self.pos_wire_actor = self._add_wireframe_overlay(self.pos_mesh)
-            if self.neg_mesh:
-                self.neg_wire_actor = self._add_wireframe_overlay(self.neg_mesh)
-        self.plotter.render()
-
-    # ═══════════════════════════════════════════════════════════════════════════
     # FEATURE: Dark / light theme toggle
     # ═══════════════════════════════════════════════════════════════════════════
 
     def toggle_ui_theme(self):
+        """
+        Switch the Qt interface between dark and light. This is an interface
+        preference only: the 3D background is a scene setting (Appearance >
+        Background, saved with sessions) and is left as it is.
+        """
         self.ui_theme = 'light' if self.ui_theme == 'dark' else 'dark'
         self._theme   = UI_THEMES[self.ui_theme]
         t = self._theme
-
-        # PyVista background
-        self.background_color = t['pv_background']
-        self.plotter.set_background(self.background_color)
 
         # Qt stylesheet (applied to the whole main window)
         qs = f"""
@@ -7623,12 +9189,6 @@ QGroupBox::title {{ subcontrol-origin:margin; left:8px; color:{t['accent']}; }}
 """
         self.main_window.setStyleSheet(qs)
 
-        # Update atom labels (colour depends on background)
-        if self.show_atom_labels:
-            for a in self.atom_label_actors:
-                self.plotter.renderer.RemoveActor(a)
-            self.atom_label_actors = []
-            self._add_atom_labels()
 
         # Update title and selection label styles
         self._update_title()
@@ -7655,7 +9215,9 @@ QGroupBox::title {{ subcontrol-origin:margin; left:8px; color:{t['accent']}; }}
         self.main_window.setStyleSheet("QMainWindow { background:#1e1e2e; }")
 
         central = QWidget(); cl = QVBoxLayout(central); cl.setContentsMargins(0,0,0,0)
-        self.plotter = QtInteractor(central)
+        # lighting='none': the app owns every light (rendering_style); PyVista
+        # would otherwise add its own light kit that the app cannot control.
+        self.plotter = QtInteractor(central, lighting='none')
         cl.addWidget(self.plotter.interactor)
         self.main_window.setCentralWidget(central)
 
@@ -7667,6 +9229,7 @@ QGroupBox::title {{ subcontrol-origin:margin; left:8px; color:{t['accent']}; }}
         # scales the parallel view) leaves the surface's true shape intact
         # at any zoom level.
         self.plotter.enable_parallel_projection()
+        self._configure_renderer()
 
         self.create_toolbar_and_side_panel()
 
@@ -7691,15 +9254,10 @@ QGroupBox::title {{ subcontrol-origin:margin; left:8px; color:{t['accent']}; }}
         if self.cubes:
             self.update_visualization()
         self.plotter.show_axes()
-        self.plotter.camera_position = "yz"
-        self.plotter.camera.azimuth   = 30
-        self.plotter.camera.elevation = 20
-        if self.cubes:
-            # Re-fit zoom to the molecule's atoms, not the isosurface that
-            # camera_position's implicit reset just fit to — otherwise the
-            # very first orbital's isosurface size sets the scale for the
-            # whole session (or, run standalone per cube file, for the export).
-            self._fit_camera_to_atoms()
+        self._init_camera()
+        self._quit_guard = _CloseGuard(self._confirm_quit, self.main_window)
+        self.main_window.installEventFilter(self._quit_guard)
+        self.app.aboutToQuit.connect(self._shutdown_store)
         self.main_window.show()
         sys.exit(self.app.exec_())
 
