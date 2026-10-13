@@ -670,8 +670,7 @@ def load_cmos_from_molden(molden_path, orbital_indices, spin='alpha'):
 
 def compute_cube_data_molden(molden_path, orbital_indices, spin,
                               grid_quality, ext_dist, bohr_const,
-                              precomputed_cmos=None, precomputed_basis=None,
-                              progress_callback=None):
+                              precomputed_cmos=None, precomputed_basis=None):
     """
     Compute orbital grids directly from a .molden file.
 
@@ -681,9 +680,6 @@ def compute_cube_data_molden(molden_path, orbital_indices, spin,
         orbital_indices entry, already in hand (e.g. from
         localization_io.localize_orbitals). When given, the normal
         load_cmos_from_molden() call is skipped.
-
-    progress_callback : optional callable(done, total), see
-        grid_utils.evaluate_orbital_grids.
 
     Returns the same list-of-dicts so _load_computed_cubes in ChemInsight3D.py
     handles all three sources identically.
@@ -698,8 +694,7 @@ def compute_cube_data_molden(molden_path, orbital_indices, spin,
     return evaluate_orbital_grids(
         final_norm_basis, coordinates_ang, atom_info, cmos, orbital_indices,
         os.path.splitext(os.path.basename(molden_path))[0],
-        grid_quality, ext_dist, bohr_const,
-        progress_callback=progress_callback)
+        grid_quality, ext_dist, bohr_const)
 
 
 # Molden shell tag -> position within its angular-momentum block.  A table
